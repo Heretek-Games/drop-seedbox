@@ -1,0 +1,21 @@
+{
+  "name": "drop-seedbox",
+  "version": "0.1.0",
+  "description": "Seedbox: qBittorrent WebUI integration and remote streaming depots plugin for Drop",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test dist/test/*.js",
+    "sign": "drop-plugin sign ."
+  },
+  "dependencies": {
+    "@drop/plugin-sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@drop/plugin-cli": "^0.1.0",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  },
+  "license": "MIT"
+}
