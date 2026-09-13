@@ -11,4 +11,4 @@ Maintained by [Heretek Games](https://github.com/Heretek-Games/drop-seedbox).
 2. **Remote Streaming Depots**: Surfaces remote seedbox storage as mountable or streaming depots in Drop's library system.
 3. **Progress Telemetry**: Streams download and seeding metrics through WebSocket channels in real time.
 
-Built on the `@drop/plugin-sdk`.
+Built on the `@droposs/plugin-sdk`.

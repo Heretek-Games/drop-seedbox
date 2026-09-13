@@ -1,4 +1,4 @@
-import type { PluginContext, ServerPlugin } from "@drop/plugin-sdk";
+import type { PluginContext, ServerPlugin } from "@droposs/plugin-sdk";
 import { QBittorrentClient, type QbitConfig } from "./qbittorrent.js";
 
 export * from "./qbittorrent.js";
