@@ -289,3 +289,150 @@ test("seedbox:progress broadcasts periodic updates to subscribers", async () => 
 
   await plugin.teardown();
 });
+
+interface RecordedCalls {
+  added: any[];
+  paused: string[][];
+  resumed: string[][];
+  deleted: Array<{ hashes: string[]; deleteFiles?: boolean }>;
+}
+
+function recordingClient(calls: RecordedCalls): SeedboxClient {
+  return {
+    async login(): Promise<void> {},
+    async getTorrents(): Promise<QbitTorrent[]> {
+      return TORRENTS;
+    },
+    async addTorrent(options): Promise<void> {
+      calls.added.push(options);
+    },
+    async pauseTorrents(hashes): Promise<void> {
+      calls.paused.push(hashes);
+    },
+    async resumeTorrents(hashes): Promise<void> {
+      calls.resumed.push(hashes);
+    },
+    async deleteTorrents(hashes, deleteFiles): Promise<void> {
+      calls.deleted.push({ hashes, deleteFiles });
+    },
+    async getTransferInfo() {
+      return {
+        dl_info_speed: 1,
+        up_info_speed: 2,
+        dl_info_data: 3,
+        up_info_data: 4,
+        connection_status: "connected",
+      };
+    },
+  };
+}
+
+test("torrent management routes require auth and call the client", async () => {
+  const calls: RecordedCalls = { added: [], paused: [], resumed: [], deleted: [] };
+  const plugin = makePlugin({ client: recordingClient(calls) });
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+  await ctx.storage.set("qbit_config", { ...CONFIG });
+
+  const add = ctx.routes.get("POST /torrents");
+  assert.ok(add, "POST /torrents must be registered");
+
+  const unauth = (await add.handler({ body: { url: "magnet:x" } } as any, {
+    params: {},
+    query: {},
+    userId: undefined,
+  })) as any;
+  assert.equal(unauth.error, "Authentication required to add torrents");
+
+  const missing = (await add.handler({ body: {} } as any, {
+    params: {},
+    query: {},
+    userId: "u1",
+  })) as any;
+  assert.equal(missing.error, "url or torrentFile is required");
+
+  const ok = (await add.handler(
+    { body: { url: "magnet:x", savePath: "/data" } } as any,
+    { params: {}, query: {}, userId: "u1" },
+  )) as any;
+  assert.equal(ok.success, true);
+  assert.equal(calls.added.length, 1);
+  assert.equal(calls.added[0].url, "magnet:x");
+
+  const base64 = Buffer.from("torrent-bytes").toString("base64");
+  await add.handler(
+    { body: { torrentFile: base64, torrentFileName: "game.torrent" } } as any,
+    { params: {}, query: {}, userId: "u1" },
+  );
+  assert.ok(calls.added[1].torrentFile instanceof Uint8Array);
+
+  const pause = ctx.routes.get("POST /torrents/:hash/pause");
+  assert.ok(pause);
+  await pause.handler({} as any, { params: { hash: "abc" }, query: {}, userId: "u1" });
+  assert.deepEqual(calls.paused, [["abc"]]);
+
+  const resume = ctx.routes.get("POST /torrents/:hash/resume");
+  assert.ok(resume);
+  await resume.handler({} as any, { params: { hash: "abc" }, query: {}, userId: "u1" });
+  assert.deepEqual(calls.resumed, [["abc"]]);
+
+  const del = ctx.routes.get("DELETE /torrents/:hash");
+  assert.ok(del);
+  await del.handler({ body: { deleteFiles: true } } as any, {
+    params: { hash: "abc" },
+    query: {},
+    userId: "u1",
+  });
+  assert.deepEqual(calls.deleted, [{ hashes: ["abc"], deleteFiles: true }]);
+
+  const transfer = ctx.routes.get("GET /transfer");
+  assert.ok(transfer);
+  const transferRes = (await transfer.handler({} as any, {
+    params: {},
+    query: {},
+  })) as any;
+  assert.equal(transferRes.transfer.dl_info_speed, 1);
+
+  await plugin.teardown();
+});
+
+test("mapping routes associate torrents and games", async () => {
+  const plugin = makePlugin({ client: fakeClient() });
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+
+  const create = ctx.routes.get("POST /mappings");
+  assert.ok(create, "POST /mappings must be registered");
+
+  const unauth = (await create.handler({ body: { gameId: "g1", hash: "h1" } } as any, {
+    params: {},
+    query: {},
+    userId: undefined,
+  })) as any;
+  assert.equal(unauth.error, "Authentication required to configure mappings");
+
+  const missing = (await create.handler({ body: { gameId: "g1" } } as any, {
+    params: {},
+    query: {},
+    userId: "u1",
+  })) as any;
+  assert.equal(missing.error, "hash or contentPath is required");
+
+  const ok = (await create.handler(
+    { body: { gameId: "g1", hash: "h1", contentPath: "/data/g1" } } as any,
+    { params: {}, query: {}, userId: "u1" },
+  )) as any;
+  assert.equal(ok.success, true);
+
+  const byGame = (await ctx.routes
+    .get("GET /mappings/:gameId")!
+    .handler({} as any, { params: { gameId: "g1" }, query: {} })) as any;
+  assert.equal(byGame.mapping.hash, "h1");
+
+  const byHash = (await ctx.routes
+    .get("GET /mappings")!
+    .handler({} as any, { params: {}, query: { hash: "h1" } })) as any;
+  assert.equal(byHash.mapping.gameId, "g1");
+
+  await plugin.teardown();
+});

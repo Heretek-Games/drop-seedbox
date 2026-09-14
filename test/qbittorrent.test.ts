@@ -381,3 +381,101 @@ test("checkHealth reports unreachable on timeout without throwing", async () => 
   assert.equal(health.authenticated, false);
   assert.match(health.error ?? "", /timed out/);
 });
+
+test("addTorrent posts a magnet URL and re-logs in once on 403", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  let addCalls = 0;
+  const fetchFn = (async (url: string | URL, init?: RequestInit) => {
+    requests.push({ url: String(url), init });
+    if (String(url).endsWith("/api/v2/auth/login")) return loginOk();
+    addCalls += 1;
+    if (addCalls === 1) return new Response("Forbidden", { status: 403 });
+    return new Response("Ok.", { status: 200 });
+  }) as typeof fetch;
+
+  const client = new QBittorrentClient(baseConfig({ fetchFn }));
+  await client.login();
+  await client.addTorrent({
+    url: "magnet:?xt=urn:btih:abc",
+    savePath: "/data/games",
+    category: "games",
+    paused: true,
+  });
+
+  assert.equal(addCalls, 2);
+  const add = requests.find(
+    (r) => r.url.endsWith("/api/v2/torrents/add") && r.init?.method === "POST",
+  );
+  assert.ok(add, "a torrents/add request must be sent");
+  const body = add.init?.body as URLSearchParams;
+  assert.equal(body.get("urls"), "magnet:?xt=urn:btih:abc");
+  assert.equal(body.get("savepath"), "/data/games");
+  assert.equal(body.get("category"), "games");
+  assert.equal(body.get("paused"), "true");
+});
+
+test("addTorrent uploads a .torrent file as multipart", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const fetchFn = (async (url: string | URL, init?: RequestInit) => {
+    requests.push({ url: String(url), init });
+    if (String(url).endsWith("/api/v2/auth/login")) return loginOk();
+    return new Response("Ok.", { status: 200 });
+  }) as typeof fetch;
+
+  const client = new QBittorrentClient(baseConfig({ fetchFn }));
+  await client.login();
+  await client.addTorrent({
+    torrentFile: new Uint8Array([1, 2, 3]),
+    torrentFileName: "game.torrent",
+    savePath: "/srv/games",
+  });
+
+  const add = requests.find((r) => r.url.endsWith("/api/v2/torrents/add"));
+  assert.ok(add?.init?.body instanceof FormData, "body must be multipart form data");
+  const form = add.init?.body as FormData;
+  assert.equal(form.get("savepath"), "/srv/games");
+  assert.ok(form.get("torrents") instanceof Blob);
+});
+
+test("addTorrent rejects an empty request", async () => {
+  const client = new QBittorrentClient(
+    baseConfig({ fetchFn: (async () => loginOk()) as typeof fetch }),
+  );
+  await assert.rejects(client.addTorrent({}), (error: unknown) => {
+    assert.ok(error instanceof QBittorrentError);
+    assert.equal(error.code, "invalid_response");
+    return true;
+  });
+});
+
+test("pause/resume/delete and transfer use the documented endpoints", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const fetchFn = (async (url: string | URL, init?: RequestInit) => {
+    requests.push({ url: String(url), init });
+    if (String(url).endsWith("/api/v2/auth/login")) return loginOk();
+    if (String(url).endsWith("/api/v2/transfer/info")) {
+      return jsonResponse({
+        dl_info_speed: 1,
+        up_info_speed: 2,
+        dl_info_data: 3,
+        up_info_data: 4,
+        connection_status: "connected",
+      });
+    }
+    return new Response("Ok.", { status: 200 });
+  }) as typeof fetch;
+
+  const client = new QBittorrentClient(baseConfig({ fetchFn }));
+  await client.login();
+  await client.pauseTorrents(["a", "b"]);
+  await client.resumeTorrents(["a"]);
+  await client.deleteTorrents(["a", "b"], true);
+  const transfer = await client.getTransferInfo();
+
+  assert.equal(transfer.dl_info_speed, 1);
+  const pause = requests.find((r) => r.url.endsWith("/api/v2/torrents/pause"));
+  assert.equal((pause?.init?.body as URLSearchParams).get("hashes"), "a|b");
+  const del = requests.find((r) => r.url.endsWith("/api/v2/torrents/delete"));
+  assert.equal((del?.init?.body as URLSearchParams).get("deleteFiles"), "true");
+});
+

@@ -7,9 +7,11 @@ import {
   QBittorrentClient,
   QBittorrentError,
   withBackoff,
+  type QbitAddTorrentOptions,
   type QbitConfig,
   type QbitErrorCode,
   type QbitTorrent,
+  type QbitTransferInfo,
 } from "./qbittorrent.js";
 
 export * from "./qbittorrent.js";
@@ -21,7 +23,23 @@ export const DEFAULT_PROGRESS_INTERVAL_MS = 15_000;
 export interface SeedboxClient {
   login(): Promise<void>;
   getTorrents(): Promise<QbitTorrent[]>;
+  addTorrent?(options: QbitAddTorrentOptions): Promise<void>;
+  pauseTorrents?(hashes: string[]): Promise<void>;
+  resumeTorrents?(hashes: string[]): Promise<void>;
+  deleteTorrents?(hashes: string[], deleteFiles?: boolean): Promise<void>;
+  getTransferInfo?(): Promise<QbitTransferInfo>;
 }
+
+/** A seedbox torrent associated with a Drop game. */
+export interface SeedboxGameMapping {
+  gameId: string;
+  hash?: string;
+  contentPath?: string;
+  updatedAt: number;
+}
+
+export const SEEDBOX_MAPPING_GAME_PREFIX = "mapping:game:";
+export const SEEDBOX_MAPPING_HASH_PREFIX = "mapping:hash:";
 
 export type QbitApiErrorCode =
   | QbitErrorCode
@@ -141,6 +159,145 @@ export default class SeedboxPlugin implements ServerPlugin {
       },
     );
 
+    // REST: Add a torrent (magnet/URL or base64 .torrent) — admin only
+    ctx.registerRoute("POST", "/torrents", async (event, routeCtx) => {
+      if (!routeCtx.userId) {
+        return { error: "Authentication required to add torrents" };
+      }
+      const body = ((await getRequestBody(event)) || {}) as {
+        url?: string;
+        torrentFile?: string;
+        torrentFileName?: string;
+        savePath?: string;
+        category?: string;
+        paused?: boolean;
+      };
+
+      let torrentFile: Uint8Array | undefined;
+      if (body.torrentFile) {
+        try {
+          torrentFile = Buffer.from(body.torrentFile, "base64");
+        } catch {
+          return { error: "torrentFile must be base64-encoded" };
+        }
+        if (torrentFile.length === 0) {
+          return { error: "torrentFile must not be empty" };
+        }
+      }
+      if (!body.url && !torrentFile) {
+        return { error: "url or torrentFile is required" };
+      }
+
+      return this.runWithClient(ctx, "POST /torrents", async (client) => {
+        if (!client.addTorrent) {
+          return { error: "Client does not support adding torrents" };
+        }
+        await client.addTorrent({
+          url: body.url,
+          torrentFile,
+          torrentFileName: body.torrentFileName,
+          savePath: body.savePath,
+          category: body.category,
+          paused: body.paused,
+        });
+        return { success: true };
+      });
+    });
+
+    // REST: Pause/resume/delete a torrent by hash — admin only
+    ctx.registerRoute("POST", "/torrents/:hash/pause", async (_event, routeCtx) =>
+      this.mutateTorrent(ctx, routeCtx, "pause"),
+    );
+    ctx.registerRoute("POST", "/torrents/:hash/resume", async (_event, routeCtx) =>
+      this.mutateTorrent(ctx, routeCtx, "resume"),
+    );
+    ctx.registerRoute("DELETE", "/torrents/:hash", async (event, routeCtx) => {
+      if (!routeCtx.userId) {
+        return { error: "Authentication required to delete torrents" };
+      }
+      const hash = routeCtx.params.hash;
+      if (!hash) return { error: "hash is required" };
+      const body = ((await getRequestBody(event)) || {}) as {
+        deleteFiles?: boolean;
+      };
+      return this.runWithClient(ctx, "DELETE /torrents", async (client) => {
+        if (!client.deleteTorrents) {
+          return { error: "Client does not support deleting torrents" };
+        }
+        await client.deleteTorrents([hash], Boolean(body.deleteFiles));
+        return { success: true };
+      });
+    });
+
+    // REST: Global transfer statistics
+    ctx.registerRoute("GET", "/transfer", async () =>
+      this.runWithClient(ctx, "GET /transfer", async (client) => {
+        if (!client.getTransferInfo) {
+          return { error: "Client does not support transfer stats" };
+        }
+        return { transfer: await client.getTransferInfo() };
+      }),
+    );
+
+    // REST: Associate a torrent/hash or content path with a Drop game
+    ctx.registerRoute("POST", "/mappings", async (event, routeCtx) => {
+      if (!routeCtx.userId) {
+        return { error: "Authentication required to configure mappings" };
+      }
+      const body = ((await getRequestBody(event)) || {}) as Partial<SeedboxGameMapping>;
+      if (!body.gameId) {
+        return { error: "gameId is required" };
+      }
+      if (!body.hash && !body.contentPath) {
+        return { error: "hash or contentPath is required" };
+      }
+      const mapping: SeedboxGameMapping = {
+        gameId: body.gameId,
+        hash: body.hash,
+        contentPath: body.contentPath,
+        updatedAt: Date.now(),
+      };
+      await ctx.storage.set(
+        `${SEEDBOX_MAPPING_GAME_PREFIX}${mapping.gameId}`,
+        mapping,
+      );
+      if (mapping.hash) {
+        await ctx.storage.set(
+          `${SEEDBOX_MAPPING_HASH_PREFIX}${mapping.hash}`,
+          mapping,
+        );
+      }
+      return { success: true, mapping };
+    });
+
+    // REST: Look up the game mapped to a hash
+    ctx.registerRoute(
+      "GET",
+      "/mappings",
+      async (_event, routeCtx): Promise<{ mapping: SeedboxGameMapping | null }> => {
+        const hash = routeCtx.query?.hash;
+        if (!hash) return { mapping: null };
+        const mapping =
+          (await ctx.storage.get<SeedboxGameMapping>(
+            `${SEEDBOX_MAPPING_HASH_PREFIX}${hash}`,
+          )) ?? null;
+        return { mapping };
+      },
+    );
+
+    // REST: Look up a game's stored mapping
+    ctx.registerRoute(
+      "GET",
+      "/mappings/:gameId",
+      async (_event, routeCtx): Promise<{ mapping: SeedboxGameMapping | null }> => {
+        const mapping =
+          (await ctx.storage.get<SeedboxGameMapping>(
+            `${SEEDBOX_MAPPING_GAME_PREFIX}${routeCtx.params.gameId}`,
+          )) ?? null;
+        return { mapping };
+      },
+    );
+
     // WebSocket: only authenticated users may subscribe to progress updates.
     ctx.registerSubscriptionAuthorizer(
       (channel) => channel === SEEDBOX_PROGRESS_CHANNEL,
@@ -181,6 +338,45 @@ export default class SeedboxPlugin implements ServerPlugin {
 
   async teardown(): Promise<void> {
     this.resetProgressPolling();
+  }
+
+  /** Build a logged-in client or return a typed "not configured" error. */
+  private async runWithClient<T>(
+    ctx: PluginContext,
+    context: string,
+    operation: (client: SeedboxClient, config: QbitConfig) => Promise<T>,
+  ): Promise<T | QbitApiError> {
+    const config = await ctx.storage.get<QbitConfig>("qbit_config");
+    if (!config) {
+      return { error: "Seedbox not configured", code: "not_configured" };
+    }
+    try {
+      const client = this.clientFactory(config);
+      await client.login();
+      return await operation(client, config);
+    } catch (error) {
+      return this.toApiError(error, ctx, context);
+    }
+  }
+
+  private async mutateTorrent(
+    ctx: PluginContext,
+    routeCtx: { params: Record<string, string>; userId?: string },
+    action: "pause" | "resume",
+  ): Promise<unknown> {
+    if (!routeCtx.userId) {
+      return { error: `Authentication required to ${action} torrents` };
+    }
+    const hash = routeCtx.params.hash;
+    if (!hash) return { error: "hash is required" };
+    return this.runWithClient(ctx, `POST /torrents/${action}`, async (client) => {
+      const method = action === "pause" ? client.pauseTorrents : client.resumeTorrents;
+      if (!method) {
+        return { error: `Client does not support ${action} torrents` };
+      }
+      await method.call(client, [hash]);
+      return { success: true as const };
+    });
   }
 
   private async sendProgressSnapshot(

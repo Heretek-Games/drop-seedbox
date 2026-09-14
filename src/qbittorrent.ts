@@ -23,6 +23,26 @@ export interface QbitTorrent {
   state: string;
 }
 
+export interface QbitAddTorrentOptions {
+  /** Magnet URI or HTTP(S) URL to a `.torrent` file. */
+  url?: string;
+  /** Raw `.torrent` file contents to upload. */
+  torrentFile?: Uint8Array;
+  torrentFileName?: string;
+  savePath?: string;
+  category?: string;
+  paused?: boolean;
+}
+
+export interface QbitTransferInfo {
+  dl_info_speed: number;
+  up_info_speed: number;
+  dl_info_data: number;
+  up_info_data: number;
+  connection_status: string;
+  [key: string]: unknown;
+}
+
 export type QbitErrorCode =
   | "auth_failed"
   | "http_error"
@@ -217,6 +237,66 @@ export class QBittorrentClient {
     });
   }
 
+  /** Add a torrent from a magnet/URL or raw `.torrent` file. */
+  async addTorrent(options: QbitAddTorrentOptions): Promise<void> {
+    if (!options.url && !options.torrentFile) {
+      throw new QBittorrentError(
+        "addTorrent requires a url or torrentFile",
+        { code: "invalid_response" },
+      );
+    }
+    await withBackoff(
+      () => this.sendTorrentAdd(options),
+      { maxRetries: this.maxRetries, baseDelayMs: this.backoffBaseMs },
+    );
+  }
+
+  /** Pause one or more torrents by hash. */
+  async pauseTorrents(hashes: string[]): Promise<void> {
+    await this.torrentAction("pause", hashes);
+  }
+
+  /** Resume one or more torrents by hash. */
+  async resumeTorrents(hashes: string[]): Promise<void> {
+    await this.torrentAction("resume", hashes);
+  }
+
+  /** Delete one or more torrents, optionally removing their data. */
+  async deleteTorrents(hashes: string[], deleteFiles = false): Promise<void> {
+    if (hashes.length === 0) return;
+    const form = new URLSearchParams({ hashes: hashes.join("|") });
+    if (deleteFiles) form.set("deleteFiles", "true");
+    await withBackoff(
+      () =>
+        this.send("/api/v2/torrents/delete", {
+          method: "POST",
+          body: form,
+        }),
+      { maxRetries: this.maxRetries, baseDelayMs: this.backoffBaseMs },
+    );
+  }
+
+  /** Global transfer statistics (`/transfer/info`). */
+  async getTransferInfo(): Promise<QbitTransferInfo> {
+    return withBackoff(
+      async () => {
+        const payload = await this.getJson<unknown>("/api/v2/transfer/info");
+        if (
+          !payload ||
+          typeof payload !== "object" ||
+          Array.isArray(payload)
+        ) {
+          throw new QBittorrentError(
+            "qBittorrent returned an unexpected transfer payload",
+            { code: "invalid_response" },
+          );
+        }
+        return payload as QbitTransferInfo;
+      },
+      { maxRetries: this.maxRetries, baseDelayMs: this.backoffBaseMs },
+    );
+  }
+
   /**
    * Probe the WebUI. Never throws: transport/auth failures are reported in the
    * returned health object.
@@ -264,8 +344,81 @@ export class QBittorrentClient {
   }
 
   private async fetchTorrents(allowRelogin = true): Promise<QbitTorrent[]> {
-    const res = await this.request("/api/v2/torrents/info", {}, true);
+    const payload = await this.getJson<unknown>("/api/v2/torrents/info", allowRelogin);
+    if (!Array.isArray(payload)) {
+      throw new QBittorrentError(
+        "qBittorrent returned an unexpected torrents payload",
+        { code: "invalid_response" },
+      );
+    }
+    return payload as QbitTorrent[];
+  }
 
+  private async torrentAction(
+    action: "pause" | "resume",
+    hashes: string[],
+  ): Promise<void> {
+    if (hashes.length === 0) return;
+    const form = new URLSearchParams({ hashes: hashes.join("|") });
+    await withBackoff(
+      () =>
+        this.send(`/api/v2/torrents/${action}`, {
+          method: "POST",
+          body: form,
+        }),
+      { maxRetries: this.maxRetries, baseDelayMs: this.backoffBaseMs },
+    );
+  }
+
+  private async sendTorrentAdd(options: QbitAddTorrentOptions): Promise<void> {
+    if (options.torrentFile) {
+      const form = new FormData();
+      const bytes = options.torrentFile;
+      form.append(
+        "torrents",
+        new Blob([bytes as BlobPart]),
+        options.torrentFileName ?? "upload.torrent",
+      );
+      if (options.savePath) form.append("savepath", options.savePath);
+      if (options.category) form.append("category", options.category);
+      if (options.paused) form.append("paused", "true");
+      await this.send("/api/v2/torrents/add", { method: "POST", body: form });
+      return;
+    }
+
+    const form = new URLSearchParams({ urls: options.url ?? "" });
+    if (options.savePath) form.set("savepath", options.savePath);
+    if (options.category) form.set("category", options.category);
+    if (options.paused) form.set("paused", "true");
+    await this.send("/api/v2/torrents/add", { method: "POST", body: form });
+  }
+
+  /** Authenticated write that re-logs in once on 401/403. */
+  private async send(
+    path: string,
+    init: RequestInit,
+    allowRelogin = true,
+  ): Promise<void> {
+    const res = await this.request(path, init, true);
+    if (res.ok) return;
+    if (
+      (res.status === 401 || res.status === 403) &&
+      allowRelogin &&
+      this.hasCredentials
+    ) {
+      this.cookie = null;
+      await this.login();
+      return this.send(path, init, false);
+    }
+    throw new QBittorrentError(
+      `qBittorrent API error: HTTP ${res.status} ${res.statusText}`.trim(),
+      { code: "http_error", status: res.status },
+    );
+  }
+
+  /** Authenticated JSON read that re-logs in once on 401/403. */
+  private async getJson<T>(path: string, allowRelogin = true): Promise<T> {
+    const res = await this.request(path, {}, true);
     if (!res.ok) {
       if (
         (res.status === 401 || res.status === 403) &&
@@ -274,30 +427,21 @@ export class QBittorrentClient {
       ) {
         this.cookie = null;
         await this.login();
-        return this.fetchTorrents(false);
+        return this.getJson<T>(path, false);
       }
       throw new QBittorrentError(
         `qBittorrent API error: HTTP ${res.status} ${res.statusText}`.trim(),
         { code: "http_error", status: res.status },
       );
     }
-
-    let payload: unknown;
     try {
-      payload = await res.json();
+      return (await res.json()) as T;
     } catch (error) {
       throw new QBittorrentError("qBittorrent returned invalid JSON", {
         code: "invalid_response",
         cause: error,
       });
     }
-    if (!Array.isArray(payload)) {
-      throw new QBittorrentError(
-        "qBittorrent returned an unexpected torrents payload",
-        { code: "invalid_response" },
-      );
-    }
-    return payload as QbitTorrent[];
   }
 
   private async request(
