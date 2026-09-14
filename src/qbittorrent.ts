@@ -40,7 +40,9 @@ export class QBittorrentClient {
     if (this.cookie) {
       headers.cookie = this.cookie;
     }
-    const res = await fetch(`${this.config.baseUrl}/api/v2/torrents/info`, { headers });
+    const res = await fetch(`${this.config.baseUrl}/api/v2/torrents/info`, {
+      headers,
+    });
     if (!res.ok) {
       throw new Error(`qBittorrent API error: ${res.statusText}`);
     }

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "description": "qBittorrent WebUI integration and remote streaming depots plugin for Drop",
   "author": "Heretek Games",
-  "apiVersion": 1,
+  "apiVersion": 2,
   "trust": "trusted",
   "storageVersion": 1,
   "capabilities": ["routes", "storage", "network", "websocket"],
-  "entry": "dist/index.js"
+  "entry": "dist/src/index.js"
 }
