@@ -4,6 +4,7 @@ import {
   QBittorrentClient,
   QBittorrentError,
   isRetryableQbitError,
+  parseQbitBaseUrl,
   withBackoff,
   type QbitConfig,
 } from "../src/qbittorrent.js";
@@ -477,5 +478,55 @@ test("pause/resume/delete and transfer use the documented endpoints", async () =
   assert.equal((pause?.init?.body as URLSearchParams).get("hashes"), "a|b");
   const del = requests.find((r) => r.url.endsWith("/api/v2/torrents/delete"));
   assert.equal((del?.init?.body as URLSearchParams).get("deleteFiles"), "true");
+});
+
+test("requests carry Origin and Referer matching the base URL", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const fetchFn = (async (url: string | URL, init?: RequestInit) => {
+    requests.push({ url: String(url), init });
+    if (String(url).endsWith("/api/v2/auth/login")) return loginOk();
+    return jsonResponse(TORRENTS);
+  }) as typeof fetch;
+
+  const client = new QBittorrentClient(baseConfig({ fetchFn }));
+  await client.login();
+  await client.getTorrents();
+
+  for (const request of requests) {
+    const headers = new Headers(request.init?.headers);
+    assert.equal(headers.get("origin"), "http://qbit.test:8080");
+    assert.equal(headers.get("referer"), "http://qbit.test:8080/");
+  }
+});
+
+test("constructor rejects invalid base URLs with invalid_config", () => {
+  for (const baseUrl of [
+    "ftp://qbit.test",
+    "not-a-url",
+    "http://user:pass@qbit.test:8080",
+    "",
+  ]) {
+    assert.throws(
+      () => new QBittorrentClient(baseConfig({ baseUrl })),
+      (error: unknown) => {
+        assert.ok(error instanceof QBittorrentError);
+        assert.equal(error.code, "invalid_config");
+        return true;
+      },
+      `expected ${JSON.stringify(baseUrl)} to be rejected`,
+    );
+  }
+});
+
+test("parseQbitBaseUrl normalizes valid URLs and rejects unsafe ones", () => {
+  assert.deepEqual(parseQbitBaseUrl("http://qbit.test:8080/"), {
+    ok: true,
+    url: "http://qbit.test:8080",
+    origin: "http://qbit.test:8080",
+  });
+  assert.equal(parseQbitBaseUrl("https://seed.example.org").ok, true);
+  assert.equal(parseQbitBaseUrl("javascript:alert(1)").ok, false);
+  assert.equal(parseQbitBaseUrl("http://u:p@qbit.test").ok, false);
+  assert.equal(parseQbitBaseUrl(123).ok, false);
 });
 

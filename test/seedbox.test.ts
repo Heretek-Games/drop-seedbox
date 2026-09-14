@@ -7,6 +7,9 @@ import SeedboxPlugin, {
 } from "../src/index.js";
 import { QBittorrentError, type QbitTorrent } from "../src/qbittorrent.js";
 
+process.env.DROP_SEEDBOX_CONFIG_KEY =
+  "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
 const TORRENTS: QbitTorrent[] = [
   {
     hash: "abc123",
@@ -160,6 +163,19 @@ test("SeedboxPlugin registers routes/WS/authorizers and enforces auth on config"
   )) as any;
   assert.equal(missingUrlRes.error, "baseUrl is required");
 
+  // 2b. POST /config: rejects non-http(s) and credential-bearing base URLs
+  const badScheme = (await configRoute.handler(
+    { body: { baseUrl: "ftp://qbit.local" } } as any,
+    { params: {}, query: {}, userId: "admin-1" },
+  )) as any;
+  assert.equal(badScheme.code, "invalid_config");
+
+  const embeddedCreds = (await configRoute.handler(
+    { body: { baseUrl: "http://user:pass@qbit.local:8080" } } as any,
+    { params: {}, query: {}, userId: "admin-1" },
+  )) as any;
+  assert.equal(embeddedCreds.code, "invalid_config");
+
   // 3. POST /config: success when authenticated with valid payload
   const successRes = (await configRoute.handler(
     { body: { ...CONFIG } } as any,
@@ -171,6 +187,62 @@ test("SeedboxPlugin registers routes/WS/authorizers and enforces auth on config"
   assert.ok(storedConfig);
   assert.equal(storedConfig.baseUrl, CONFIG.baseUrl);
   assert.equal(storedConfig.username, CONFIG.username);
+  // The password is never persisted in plaintext.
+  assert.equal(storedConfig.credentialsEncrypted, true);
+  assert.notEqual(storedConfig.password, CONFIG.password);
+  assert.match(storedConfig.password, /^v1:/);
+
+  await plugin.teardown();
+});
+
+test("POST /config refuses to persist a plaintext password without a key", async () => {
+  const saved = process.env.DROP_SEEDBOX_CONFIG_KEY;
+  delete process.env.DROP_SEEDBOX_CONFIG_KEY;
+  try {
+    const plugin = makePlugin();
+    const ctx = makeCtx();
+    await plugin.init(ctx);
+    const configRoute = ctx.routes.get("POST /config");
+    assert.ok(configRoute);
+
+    const res = (await configRoute.handler({ body: { ...CONFIG } } as any, {
+      params: {},
+      query: {},
+      userId: "admin-1",
+    })) as any;
+    assert.equal(res.code, "invalid_config");
+    assert.match(res.error, /DROP_SEEDBOX_CONFIG_KEY/);
+    assert.equal(await ctx.storage.get("qbit_config"), null);
+
+    await plugin.teardown();
+  } finally {
+    process.env.DROP_SEEDBOX_CONFIG_KEY = saved;
+  }
+});
+
+test("GET read routes reject unauthenticated callers", async () => {
+  const plugin = makePlugin({ client: fakeClient() });
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+  await ctx.storage.set("qbit_config", { ...CONFIG });
+
+  const checks: Array<[string, Record<string, string>]> = [
+    ["GET /torrents", {}],
+    ["GET /transfer", {}],
+    ["GET /health", {}],
+    ["GET /mappings", { hash: "h1" }],
+    ["GET /mappings/:gameId", { gameId: "g1" }],
+  ];
+  for (const [name, params] of checks) {
+    const route = ctx.routes.get(name);
+    assert.ok(route, `${name} must be registered`);
+    const res = (await route.handler({} as any, {
+      params,
+      query: {},
+      userId: undefined,
+    })) as any;
+    assert.equal(res.code, "unauthorized", `${name} must require auth`);
+  }
 
   await plugin.teardown();
 });
@@ -180,6 +252,7 @@ test("GET /torrents reports a typed error when unconfigured", async () => {
   const res = (await handler({} as any, {
     params: {},
     query: {},
+    userId: "u1",
   })) as any;
 
   assert.equal(res.error, "Seedbox not configured");
@@ -197,6 +270,7 @@ test("GET /torrents returns torrents on success", async () => {
   const res = (await handler({} as any, {
     params: {},
     query: {},
+    userId: "u1",
   })) as any;
 
   assert.deepEqual(res.torrents, TORRENTS);
@@ -218,6 +292,7 @@ test("GET /torrents returns a typed error instead of rejecting on client failure
   const res = (await handler({} as any, {
     params: {},
     query: {},
+    userId: "u1",
   })) as any;
 
   assert.equal(res.code, "auth_failed");
@@ -406,6 +481,7 @@ test("torrent management routes require auth and call the client", async () => {
   const transferRes = (await transfer.handler({} as any, {
     params: {},
     query: {},
+    userId: "u1",
   })) as any;
   assert.equal(transferRes.transfer.dl_info_speed, 1);
 
@@ -442,12 +518,20 @@ test("mapping routes associate torrents and games", async () => {
 
   const byGame = (await ctx.routes
     .get("GET /mappings/:gameId")!
-    .handler({} as any, { params: { gameId: "g1" }, query: {} })) as any;
+    .handler({} as any, {
+      params: { gameId: "g1" },
+      query: {},
+      userId: "u1",
+    })) as any;
   assert.equal(byGame.mapping.hash, "h1");
 
   const byHash = (await ctx.routes
     .get("GET /mappings")!
-    .handler({} as any, { params: {}, query: { hash: "h1" } })) as any;
+    .handler({} as any, {
+      params: {},
+      query: { hash: "h1" },
+      userId: "u1",
+    })) as any;
   assert.equal(byHash.mapping.gameId, "g1");
 
   await plugin.teardown();
@@ -463,6 +547,7 @@ test("health reports not_configured then a probe result", async () => {
   const unconfigured = (await health.handler({} as any, {
     params: {},
     query: {},
+    userId: "u1",
   })) as any;
   assert.equal(unconfigured.code, "not_configured");
 
@@ -470,6 +555,7 @@ test("health reports not_configured then a probe result", async () => {
   const probe = (await health.handler({} as any, {
     params: {},
     query: {},
+    userId: "u1",
   })) as any;
   assert.equal(probe.health.reachable, true);
   assert.equal(probe.health.authenticated, true);

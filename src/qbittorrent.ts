@@ -48,7 +48,52 @@ export type QbitErrorCode =
   | "http_error"
   | "network_error"
   | "timeout"
-  | "invalid_response";
+  | "invalid_response"
+  | "invalid_config";
+
+export interface ParsedQbitBaseUrl {
+  ok: true;
+  /** Normalized absolute URL without a trailing slash. */
+  url: string;
+  /** Origin used for the qBittorrent `Origin`/`Referer` CSRF headers. */
+  origin: string;
+}
+
+export interface InvalidQbitBaseUrl {
+  ok: false;
+  error: string;
+}
+
+/**
+ * Validate and normalize a qBittorrent base URL. Only absolute `http(s)` URLs
+ * are accepted; URLs carrying embedded credentials are rejected so they cannot
+ * be silently persisted or leaked via logs.
+ */
+export function parseQbitBaseUrl(
+  raw: unknown,
+): ParsedQbitBaseUrl | InvalidQbitBaseUrl {
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return { ok: false, error: "baseUrl is required" };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw.trim());
+  } catch {
+    return { ok: false, error: "baseUrl must be an absolute http(s) URL" };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, error: "baseUrl must use the http or https scheme" };
+  }
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      error:
+        "baseUrl must not contain embedded credentials; use the username/password fields",
+    };
+  }
+  const url = parsed.toString().replace(/\/+$/, "");
+  return { ok: true, url, origin: parsed.origin };
+}
 
 export class QBittorrentError extends Error {
   readonly code: QbitErrorCode;
@@ -158,15 +203,19 @@ function extractSessionCookie(res: Response): string | null {
 export class QBittorrentClient {
   private cookie: string | null = null;
   private readonly baseUrl: string;
+  private readonly origin: string;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly backoffBaseMs: number;
   private readonly fetchFn: typeof fetch;
 
   constructor(private readonly config: QbitConfig) {
-    let baseUrl = config.baseUrl;
-    while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
-    this.baseUrl = baseUrl;
+    const parsed = parseQbitBaseUrl(config.baseUrl);
+    if (!parsed.ok) {
+      throw new QBittorrentError(parsed.error, { code: "invalid_config" });
+    }
+    this.baseUrl = parsed.url;
+    this.origin = parsed.origin;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.backoffBaseMs = config.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS;
@@ -453,6 +502,10 @@ export class QBittorrentClient {
     if (withSession && this.cookie) {
       headers.set("cookie", this.cookie);
     }
+    // qBittorrent's WebUI CSRF protection expects Referer/Origin matching the
+    // request Host; set them unless the caller overrides them.
+    if (!headers.has("origin")) headers.set("origin", this.origin);
+    if (!headers.has("referer")) headers.set("referer", `${this.baseUrl}/`);
     try {
       return await this.fetchFn(`${this.baseUrl}${path}`, {
         ...init,
