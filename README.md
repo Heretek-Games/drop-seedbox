@@ -1,15 +1,48 @@
 # drop-seedbox
 
-Seedbox and qBittorrent remote depot integration plugin for the [Drop](https://github.com/Heretek-Games/drop) game distribution platform.
+qBittorrent WebUI integration plugin for the [Drop](https://github.com/Heretek-Games/drop) game distribution platform, built on `@droposs/plugin-sdk` (^0.4.0).
 
 Maintained by [Heretek Games](https://github.com/Heretek-Games/drop-seedbox).
 
-## Overview
+## Status
 
-`drop-seedbox` bridges self-hosted Drop instances with headless torrent seedboxes:
+### Implemented
 
-1. **WebUI Integration**: Connects securely to qBittorrent via the v2 WebUI API.
-2. **Remote Streaming Depots**: Surfaces remote seedbox storage as mountable or streaming depots in Drop's library system.
-3. **Progress Telemetry**: Streams download and seeding metrics through WebSocket channels in real time.
+- **qBittorrent WebUI v2 client** (`src/qbittorrent.ts`):
+  - `POST /api/v2/auth/login` with explicit failures for missing credentials, non-OK responses, rejected logins, and missing session cookies.
+  - `GET /api/v2/torrents/info` with configurable timeout (`AbortSignal.timeout`, default 10s), typed errors, exponential backoff for transient failures (timeouts, network errors, 5xx), and one-shot re-login when the session expires (401/403).
+  - `checkHealth()` connection probe (reachability, authentication, latency) that never throws.
+- **Plugin routes** (`src/index.ts`):
+  - `POST /config` — authenticated; stores WebUI `baseUrl`/credentials and resets cached sessions.
+  - `GET /torrents` — returns `{ torrents }` or a typed `{ error, code }` response; client failures never surface as unhandled rejections.
+- **`seedbox:progress` WebSocket channel** — authenticated users only (subscription authorizer + per-message `userId` gate). Subscribers receive an immediate torrent snapshot, then periodic snapshots (default 15s) broadcast on the channel. `{"type":"unsubscribe"}` stops updates; `{"type":"ping"}` replies with `pong`.
 
-Built on the `@droposs/plugin-sdk`.
+### Roadmap (not implemented yet)
+
+The repository name and earlier docs referenced remote streaming depots and game-library integration. Those features do **not** exist yet:
+
+- Remote / mountable streaming depots (Heretek-Games/drop-seedbox#3, #4)
+- Play-while-download streaming (Heretek-Games/drop-seedbox#5)
+- Depot chunk authentication, SSRF protections, rate limits (Heretek-Games/drop-seedbox#6)
+- Admin UI + monitoring (Heretek-Games/drop-seedbox#7)
+- Adding/managing torrents (magnet or `.torrent`), content-path → game mapping, `sync`/`transfer` namespaces (Heretek-Games/drop-seedbox#2)
+
+Progress updates are polled snapshots of the torrent list, not byte-level or per-peer real-time telemetry.
+
+## Security invariants
+
+- Credentials and session cookies (`SID`) are never logged. Error messages and log lines contain only status codes and error classifications.
+- `POST /config` requires an authenticated `userId`.
+- `seedbox:progress` subscriptions require an authenticated `userId`; anonymous subscribers are rejected by the registered subscription authorizer and by the handler.
+- Outbound requests are bounded by a per-request timeout and retried with backoff so unreachable seedboxes cannot pin handlers indefinitely.
+
+## Development
+
+```bash
+npm ci
+npm run build
+npm test
+npm run typecheck
+```
+
+CI runs the same commands on Node 22 (`.github/workflows/ci.yml`).

@@ -2,11 +2,11 @@
   "id": "drop-seedbox",
   "name": "Seedbox & qBittorrent Depot Provider",
   "version": "0.1.0",
-  "description": "qBittorrent WebUI integration and remote streaming depots plugin for Drop",
+  "description": "qBittorrent WebUI integration plugin for Drop",
   "author": "Heretek Games",
   "apiVersion": 2,
   "trust": "trusted",
   "storageVersion": 1,
-  "capabilities": ["routes", "storage", "network", "websocket"],
+  "capabilities": ["routes", "storage", "network", "websocket", "events"],
   "entry": "dist/src/index.js"
 }
