@@ -18,6 +18,17 @@ const TORRENTS: QbitTorrent[] = [
   },
 ];
 
+const CONFIG = {
+  baseUrl: "http://qbit.local:8080",
+  username: "admin",
+  password: "password123",
+};
+
+interface PluginOptions {
+  client?: SeedboxClient;
+  progressIntervalMs?: number;
+}
+
 function makeCtx(): MockPluginContext {
   return new MockPluginContext("drop-seedbox", [
     "routes",
@@ -44,29 +55,52 @@ function fakeClient(options: {
   };
 }
 
-function makePlugin(options: {
-  client?: SeedboxClient;
-  progressIntervalMs?: number;
-} = {}): SeedboxPlugin {
+function makePlugin(options: PluginOptions = {}): SeedboxPlugin {
   return new SeedboxPlugin({
     clientFactory: () => options.client ?? fakeClient(),
     progressIntervalMs: options.progressIntervalMs ?? 60_000,
   });
 }
 
-async function configure(ctx: MockPluginContext, userId = "admin-1"): Promise<void> {
-  const configRoute = ctx.routes.get("POST /config");
-  assert.ok(configRoute, "POST /config must be registered");
-  await configRoute.handler(
-    {
-      body: {
-        baseUrl: "http://qbit.local:8080",
-        username: "admin",
-        password: "password123",
-      },
-    } as any,
-    { params: {}, query: {}, userId },
-  );
+async function makeRouteHarness(options: PluginOptions = {}) {
+  const plugin = makePlugin(options);
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+  const route = ctx.routes.get("GET /torrents");
+  assert.ok(route, "GET /torrents must be registered");
+  return { plugin, ctx, handler: route.handler };
+}
+
+interface WsHarness {
+  plugin: SeedboxPlugin;
+  ctx: MockPluginContext;
+  sent: any[];
+  invoke(msg: unknown, userId?: string | null): Promise<void>;
+}
+
+async function makeWsHarness(
+  options: PluginOptions & { configured?: boolean } = {},
+): Promise<WsHarness> {
+  const plugin = makePlugin(options);
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+  if (options.configured) {
+    await ctx.storage.set("qbit_config", { ...CONFIG });
+  }
+  const progressWs = ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL);
+  assert.ok(progressWs, "seedbox:progress websocket handler must be registered");
+  const sent: any[] = [];
+  const send = (data: unknown) => {
+    sent.push(data);
+  };
+  return {
+    plugin,
+    ctx,
+    sent,
+    invoke: async (msg, userId: string | null = "admin-1") => {
+      await progressWs(msg, { userId: userId ?? undefined, send });
+    },
+  };
 }
 
 test("SeedboxPlugin registers routes/WS/authorizers and enforces auth on config", async () => {
@@ -80,8 +114,10 @@ test("SeedboxPlugin registers routes/WS/authorizers and enforces auth on config"
   const torrentsRoute = ctx.routes.get("GET /torrents");
   assert.ok(torrentsRoute, "GET /torrents must be registered");
 
-  const progressWs = ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL);
-  assert.ok(progressWs, "seedbox:progress websocket handler must be registered");
+  assert.ok(
+    ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL),
+    "seedbox:progress websocket handler must be registered",
+  );
 
   assert.equal(ctx.authorizers.length, 1, "a subscription authorizer is registered");
   const authorizer = ctx.authorizers[0];
@@ -118,33 +154,22 @@ test("SeedboxPlugin registers routes/WS/authorizers and enforces auth on config"
 
   // 3. POST /config: success when authenticated with valid payload
   const successRes = (await configRoute.handler(
-    {
-      body: {
-        baseUrl: "http://qbit.local:8080",
-        username: "admin",
-        password: "password123",
-      },
-    } as any,
+    { body: { ...CONFIG } } as any,
     { params: {}, query: {}, userId: "admin-1" },
   )) as any;
   assert.equal(successRes.success, true);
 
   const storedConfig = await ctx.storage.get<any>("qbit_config");
   assert.ok(storedConfig);
-  assert.equal(storedConfig.baseUrl, "http://qbit.local:8080");
-  assert.equal(storedConfig.username, "admin");
+  assert.equal(storedConfig.baseUrl, CONFIG.baseUrl);
+  assert.equal(storedConfig.username, CONFIG.username);
 
   await plugin.teardown();
 });
 
 test("GET /torrents reports a typed error when unconfigured", async () => {
-  const plugin = makePlugin();
-  const ctx = makeCtx();
-  await plugin.init(ctx);
-
-  const torrentsRoute = ctx.routes.get("GET /torrents");
-  assert.ok(torrentsRoute, "GET /torrents must be registered");
-  const res = (await torrentsRoute.handler({} as any, {
+  const { plugin, handler } = await makeRouteHarness();
+  const res = (await handler({} as any, {
     params: {},
     query: {},
   })) as any;
@@ -156,14 +181,12 @@ test("GET /torrents reports a typed error when unconfigured", async () => {
 });
 
 test("GET /torrents returns torrents on success", async () => {
-  const plugin = makePlugin({ client: fakeClient() });
-  const ctx = makeCtx();
-  await plugin.init(ctx);
-  await configure(ctx);
+  const { plugin, ctx, handler } = await makeRouteHarness({
+    client: fakeClient(),
+  });
+  await ctx.storage.set("qbit_config", { ...CONFIG });
 
-  const torrentsRoute = ctx.routes.get("GET /torrents");
-  assert.ok(torrentsRoute);
-  const res = (await torrentsRoute.handler({} as any, {
+  const res = (await handler({} as any, {
     params: {},
     query: {},
   })) as any;
@@ -174,7 +197,7 @@ test("GET /torrents returns torrents on success", async () => {
 });
 
 test("GET /torrents returns a typed error instead of rejecting on client failure", async () => {
-  const plugin = makePlugin({
+  const { plugin, ctx, handler } = await makeRouteHarness({
     client: fakeClient({
       loginError: new QBittorrentError("bad credentials", {
         code: "auth_failed",
@@ -182,13 +205,9 @@ test("GET /torrents returns a typed error instead of rejecting on client failure
       }),
     }),
   });
-  const ctx = makeCtx();
-  await plugin.init(ctx);
-  await configure(ctx);
+  await ctx.storage.set("qbit_config", { ...CONFIG });
 
-  const torrentsRoute = ctx.routes.get("GET /torrents");
-  assert.ok(torrentsRoute);
-  const res = (await torrentsRoute.handler({} as any, {
+  const res = (await handler({} as any, {
     params: {},
     query: {},
   })) as any;
@@ -200,139 +219,66 @@ test("GET /torrents returns a typed error instead of rejecting on client failure
 });
 
 test("seedbox:progress rejects unauthenticated senders", async () => {
-  const plugin = makePlugin();
-  const ctx = makeCtx();
-  await plugin.init(ctx);
+  const { plugin, sent, invoke } = await makeWsHarness();
+  await invoke({ type: "subscribe" }, null);
 
-  const progressWs = ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL);
-  assert.ok(progressWs);
-  let sent: any = null;
-  await progressWs(
-    { type: "subscribe" },
-    {
-      userId: undefined,
-      send: (data) => {
-        sent = data;
-      },
-    },
-  );
-
-  assert.equal(sent.event, "error");
-  assert.equal(sent.code, "unauthorized");
+  assert.equal(sent[0].event, "error");
+  assert.equal(sent[0].code, "unauthorized");
 
   await plugin.teardown();
 });
 
 test("seedbox:progress answers ping with pong", async () => {
-  const plugin = makePlugin();
-  const ctx = makeCtx();
-  await plugin.init(ctx);
+  const { plugin, sent, invoke } = await makeWsHarness();
+  await invoke({ type: "ping" });
 
-  const progressWs = ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL);
-  assert.ok(progressWs);
-  let sent: any = null;
-  await progressWs(
-    { type: "ping" },
-    {
-      userId: "admin-1",
-      send: (data) => {
-        sent = data;
-      },
-    },
-  );
-
-  assert.equal(sent.event, "pong");
-  assert.equal(typeof sent.time, "number");
+  assert.equal(sent[0].event, "pong");
+  assert.equal(typeof sent[0].time, "number");
 
   await plugin.teardown();
 });
 
 test("seedbox:progress sends a real torrent snapshot on subscribe and stops on unsubscribe", async () => {
-  const plugin = makePlugin({ client: fakeClient() });
-  const ctx = makeCtx();
-  await plugin.init(ctx);
-  await ctx.storage.set("qbit_config", {
-    baseUrl: "http://qbit.local:8080",
-    username: "admin",
-    password: "password123",
+  const { plugin, sent, invoke } = await makeWsHarness({
+    client: fakeClient(),
+    configured: true,
   });
 
-  const progressWs = ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL);
-  assert.ok(progressWs);
-  const sent: any[] = [];
-  await progressWs(
-    { type: "subscribe" },
-    {
-      userId: "admin-1",
-      send: (data) => {
-        sent.push(data);
-      },
-    },
-  );
-
+  await invoke({ type: "subscribe" });
   assert.equal(sent.length, 1);
   assert.equal(sent[0].event, "progress");
   assert.deepEqual(sent[0].torrents, TORRENTS);
   assert.equal(typeof sent[0].time, "number");
 
-  await progressWs(
-    { type: "unsubscribe" },
-    {
-      userId: "admin-1",
-      send: (data) => {
-        sent.push(data);
-      },
-    },
-  );
+  await invoke({ type: "unsubscribe" });
   assert.equal(sent[1].event, "unsubscribed");
 
   await plugin.teardown();
 });
 
 test("seedbox:progress reports not_configured to authenticated subscribers", async () => {
-  const plugin = makePlugin();
-  const ctx = makeCtx();
-  await plugin.init(ctx);
+  const { plugin, sent, invoke } = await makeWsHarness();
+  await invoke({ type: "subscribe" });
 
-  const progressWs = ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL);
-  assert.ok(progressWs);
-  let sent: any = null;
-  await progressWs(
-    { type: "subscribe" },
-    {
-      userId: "admin-1",
-      send: (data) => {
-        sent = data;
-      },
-    },
-  );
-
-  assert.equal(sent.event, "error");
-  assert.equal(sent.code, "not_configured");
+  assert.equal(sent[0].event, "error");
+  assert.equal(sent[0].code, "not_configured");
 
   await plugin.teardown();
 });
 
 test("seedbox:progress broadcasts periodic updates to subscribers", async () => {
-  const listeners: Array<(event: unknown) => void> = [];
+  const listeners: unknown[] = [];
   const plugin = makePlugin({ client: fakeClient(), progressIntervalMs: 5 });
   const ctx = makeCtx();
   ctx.subscribe(SEEDBOX_PROGRESS_CHANNEL, (event) => {
-    listeners.push(event as any);
+    listeners.push(event);
   });
   await plugin.init(ctx);
-  await ctx.storage.set("qbit_config", {
-    baseUrl: "http://qbit.local:8080",
-    username: "admin",
-    password: "password123",
-  });
+  await ctx.storage.set("qbit_config", { ...CONFIG });
 
   const progressWs = ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL);
   assert.ok(progressWs);
-  await progressWs(
-    { type: "subscribe" },
-    { userId: "admin-1", send: () => {} },
-  );
+  await progressWs({ type: "subscribe" }, { userId: "admin-1", send: () => {} });
 
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.ok(
