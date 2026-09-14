@@ -19,6 +19,8 @@ Maintained by [Heretek Games](https://github.com/Heretek-Games/drop-seedbox).
   - `POST /torrents` — authenticated; adds a torrent from a magnet/URL or base64 `.torrent` (`url`, `torrentFile`, `torrentFileName`, `savePath`, `category`, `paused`).
   - `POST /torrents/:hash/pause`, `POST /torrents/:hash/resume`, `DELETE /torrents/:hash` — authenticated; `deleteFiles` is honored on delete.
   - `GET /transfer` — global transfer statistics.
+  - `GET /health` — connection health probe (reachability, authentication, latency) that never throws.
+  - `GET/POST /depots`, `DELETE /depots/:id` — authenticated registry of remote/seedbox depot endpoints with per-depot enable/disable and priority.
   - `POST /mappings` and `GET /mappings`, `GET /mappings/:gameId` — associate a torrent hash or content path with a Drop game.
 - **`seedbox:progress` WebSocket channel** — authenticated users only (subscription authorizer + per-message `userId` gate). Subscribers receive an immediate torrent snapshot, then periodic snapshots (default 15s) broadcast on the channel. `{"type":"unsubscribe"}` stops updates; `{"type":"ping"}` replies with `pong`.
 
@@ -26,10 +28,10 @@ Maintained by [Heretek Games](https://github.com/Heretek-Games/drop-seedbox).
 
 The repository name and earlier docs referenced remote streaming depots and game-library integration. Those features do **not** exist yet:
 
-- Remote / mountable streaming depots (Heretek-Games/drop-seedbox#3, #4)
+- Remote / mountable streaming depots (Heretek-Games/drop-seedbox#3, #4) — the depot registry, health probe and validation exist, but no torrent-backed chunk backend
 - Play-while-download streaming (Heretek-Games/drop-seedbox#5)
 - SSRF protections and rate limits (Heretek-Games/drop-seedbox#6; the torrential depot chunk endpoint now supports opt-in authentication via `TORRENTIAL_REQUIRE_CHUNK_AUTH`)
-- Admin UI + monitoring (Heretek-Games/drop-seedbox#7)
+- Admin UI (Heretek-Games/drop-seedbox#7 — the health/depot monitoring backend is in place; a rendered admin page is not)
 
 Progress updates are polled snapshots of the torrent list, not byte-level or per-peer real-time telemetry.
 

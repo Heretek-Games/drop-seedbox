@@ -7,7 +7,7 @@
 ## 1. Architecture
 
 - **`src/qbittorrent.ts`**: HTTP client for qBittorrent WebUI v2 API (`/api/v2/auth/login`, `/api/v2/torrents/info|add|pause|resume|delete`, `/api/v2/transfer/info`), with typed errors, per-request timeouts, exponential backoff, session re-login, and a connection health probe.
-- **`src/index.ts`**: Plugin implementation providing `/config`, `/torrents` (list/add/manage), `/transfer`, and `/mappings` endpoints, and the `seedbox:progress` WebSocket channel (authenticated periodic torrent snapshots).
+- **`src/index.ts`**: Plugin implementation providing `/config`, `/torrents` (list/add/manage), `/transfer`, `/health`, `/depots`, and `/mappings` endpoints, and the `seedbox:progress` WebSocket channel (authenticated periodic torrent snapshots).
 - **Capabilities**: `routes`, `storage`, `network`, `websocket`, `events`.
 
 ---

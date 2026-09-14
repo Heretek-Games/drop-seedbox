@@ -52,6 +52,14 @@ function fakeClient(options: {
       if (options.torrentsError) throw options.torrentsError;
       return options.torrents ?? TORRENTS;
     },
+    async checkHealth() {
+      return {
+        reachable: true,
+        authenticated: true,
+        checkedAt: Date.now(),
+        latencyMs: 5,
+      };
+    },
   };
 }
 
@@ -324,6 +332,14 @@ function recordingClient(calls: RecordedCalls): SeedboxClient {
         connection_status: "connected",
       };
     },
+    async checkHealth() {
+      return {
+        reachable: true,
+        authenticated: true,
+        checkedAt: Date.now(),
+        latencyMs: 5,
+      };
+    },
   };
 }
 
@@ -433,6 +449,85 @@ test("mapping routes associate torrents and games", async () => {
     .get("GET /mappings")!
     .handler({} as any, { params: {}, query: { hash: "h1" } })) as any;
   assert.equal(byHash.mapping.gameId, "g1");
+
+  await plugin.teardown();
+});
+
+test("health reports not_configured then a probe result", async () => {
+  const plugin = makePlugin({ client: fakeClient() });
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+
+  const health = ctx.routes.get("GET /health");
+  assert.ok(health);
+  const unconfigured = (await health.handler({} as any, {
+    params: {},
+    query: {},
+  })) as any;
+  assert.equal(unconfigured.code, "not_configured");
+
+  await ctx.storage.set("qbit_config", { ...CONFIG });
+  const probe = (await health.handler({} as any, {
+    params: {},
+    query: {},
+  })) as any;
+  assert.equal(probe.health.reachable, true);
+  assert.equal(probe.health.authenticated, true);
+
+  await plugin.teardown();
+});
+
+test("depot registry requires auth and orders by priority", async () => {
+  const plugin = makePlugin({ client: fakeClient() });
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+
+  const list = ctx.routes.get("GET /depots");
+  const create = ctx.routes.get("POST /depots");
+  const remove = ctx.routes.get("DELETE /depots/:id");
+  assert.ok(list && create && remove);
+
+  const unauth = (await list.handler({} as any, {
+    params: {},
+    query: {},
+    userId: undefined,
+  })) as any;
+  assert.equal(unauth.error, "Authentication required to view depots");
+
+  const missing = (await create.handler({ body: {} } as any, {
+    params: {},
+    query: {},
+    userId: "u1",
+  })) as any;
+  assert.equal(missing.error, "id and endpoint are required");
+
+  await create.handler({ body: { id: "b", endpoint: "http://b", priority: 200 } } as any, {
+    params: {},
+    query: {},
+    userId: "u1",
+  });
+  await create.handler({ body: { id: "a", endpoint: "http://a", priority: 10 } } as any, {
+    params: {},
+    query: {},
+    userId: "u1",
+  });
+
+  const listed = (await list.handler({} as any, {
+    params: {},
+    query: {},
+    userId: "u1",
+  })) as any;
+  assert.deepEqual(
+    listed.depots.map((depot: { id: string }) => depot.id),
+    ["a", "b"],
+  );
+
+  const removed = (await remove.handler({} as any, {
+    params: { id: "a" },
+    query: {},
+    userId: "u1",
+  })) as any;
+  assert.equal(removed.removed, 1);
 
   await plugin.teardown();
 });

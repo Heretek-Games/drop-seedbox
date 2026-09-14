@@ -9,6 +9,7 @@ import {
   withBackoff,
   type QbitAddTorrentOptions,
   type QbitConfig,
+  type QbitConnectionHealth,
   type QbitErrorCode,
   type QbitTorrent,
   type QbitTransferInfo,
@@ -28,7 +29,20 @@ export interface SeedboxClient {
   resumeTorrents?(hashes: string[]): Promise<void>;
   deleteTorrents?(hashes: string[], deleteFiles?: boolean): Promise<void>;
   getTransferInfo?(): Promise<QbitTransferInfo>;
+  checkHealth?(): Promise<QbitConnectionHealth>;
 }
+
+/** A registered remote/seedbox depot endpoint. */
+export interface SeedboxDepot {
+  id: string;
+  endpoint: string;
+  enabled: boolean;
+  /** Lower values are preferred by the client. */
+  priority: number;
+  updatedAt: number;
+}
+
+export const SEEDBOX_DEPOTS_KEY = "seedbox:depots";
 
 /** A seedbox torrent associated with a Drop game. */
 export interface SeedboxGameMapping {
@@ -90,8 +104,12 @@ async function getRequestBody<T = any>(event: any): Promise<T> {
   }
 }
 
-export default class SeedboxPlugin implements ServerPlugin {
-  metadata = {
+/** Read the configured remote depot endpoints. */
+async function readDepots(ctx: PluginContext): Promise<SeedboxDepot[]> {
+  return (await ctx.storage.get<SeedboxDepot[]>(SEEDBOX_DEPOTS_KEY)) ?? [];
+}
+
+export default class SeedboxPlugin implements ServerPlugin {  metadata = {
     id: "drop-seedbox",
     name: "Seedbox & qBittorrent Depot Provider",
     version: "0.1.0",
@@ -238,6 +256,88 @@ export default class SeedboxPlugin implements ServerPlugin {
         return { transfer: await client.getTransferInfo() };
       }),
     );
+
+    // REST: Connection health (never throws; reports reachability/auth)
+    ctx.registerRoute("GET", "/health", async () => {
+      const config = await ctx.storage.get<QbitConfig>("qbit_config");
+      if (!config) {
+        return { error: "Seedbox not configured", code: "not_configured" };
+      }
+      const client = this.clientFactory(config);
+      if (client.checkHealth) {
+        return { health: await client.checkHealth() };
+      }
+      try {
+        await client.login();
+        return {
+          health: {
+            reachable: true,
+            authenticated: true,
+            checkedAt: Date.now(),
+            latencyMs: 0,
+          },
+        };
+      } catch (error) {
+        return {
+          health: {
+            reachable: false,
+            authenticated: false,
+            checkedAt: Date.now(),
+            latencyMs: 0,
+            error: error instanceof Error ? error.message : "unknown error",
+          },
+        };
+      }
+    });
+
+    // REST: registered remote/seedbox depot endpoints (admin, lowest priority first)
+    ctx.registerRoute("GET", "/depots", async (_event, routeCtx) => {
+      if (!routeCtx.userId) {
+        return { error: "Authentication required to view depots" };
+      }
+      const depots = await readDepots(ctx);
+      depots.sort((a, b) => a.priority - b.priority);
+      return { depots, count: depots.length };
+    });
+
+    ctx.registerRoute("POST", "/depots", async (event, routeCtx) => {
+      if (!routeCtx.userId) {
+        return { error: "Authentication required to configure depots" };
+      }
+      const body = ((await getRequestBody(event)) || {}) as Partial<SeedboxDepot>;
+      if (!body.id || !body.endpoint) {
+        return { error: "id and endpoint are required" };
+      }
+      const priority =
+        typeof body.priority === "number" &&
+        Number.isInteger(body.priority) &&
+        body.priority >= 0
+          ? body.priority
+          : 100;
+      const depot: SeedboxDepot = {
+        id: body.id,
+        endpoint: body.endpoint,
+        enabled: body.enabled ?? true,
+        priority,
+        updatedAt: Date.now(),
+      };
+      const depots = (await readDepots(ctx)).filter((entry) => entry.id !== depot.id);
+      depots.push(depot);
+      await ctx.storage.set(SEEDBOX_DEPOTS_KEY, depots);
+      return { success: true, depot };
+    });
+
+    ctx.registerRoute("DELETE", "/depots/:id", async (_event, routeCtx) => {
+      if (!routeCtx.userId) {
+        return { error: "Authentication required to configure depots" };
+      }
+      const id = routeCtx.params.id;
+      if (!id) return { error: "id is required" };
+      const depots = await readDepots(ctx);
+      const next = depots.filter((entry) => entry.id !== id);
+      await ctx.storage.set(SEEDBOX_DEPOTS_KEY, next);
+      return { success: true, removed: depots.length - next.length };
+    });
 
     // REST: Associate a torrent/hash or content path with a Drop game
     ctx.registerRoute("POST", "/mappings", async (event, routeCtx) => {
