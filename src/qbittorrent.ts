@@ -1,3 +1,5 @@
+import { randomInt } from "node:crypto";
+
 export interface QbitConfig {
   baseUrl: string;
   username?: string;
@@ -111,7 +113,7 @@ export async function withBackoff<T>(
       if (attempt === maxRetries || !retryable(error)) throw error;
       const base = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
       const delayMs = options.jitter
-        ? Math.round(base * (0.5 + Math.random() * 0.5))
+        ? Math.round(base * (0.5 + randomInt(0, 1000) / 2000))
         : base;
       options.onRetry?.(error, attempt + 1, delayMs);
       await sleep(delayMs);
@@ -142,7 +144,9 @@ export class QBittorrentClient {
   private readonly fetchFn: typeof fetch;
 
   constructor(private readonly config: QbitConfig) {
-    this.baseUrl = config.baseUrl.replace(/\/+$/, "");
+    let baseUrl = config.baseUrl;
+    while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
+    this.baseUrl = baseUrl;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.backoffBaseMs = config.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS;
