@@ -126,8 +126,9 @@ const CONFIG_KEY = "qbit_config";
 
 /**
  * Load the persisted qBittorrent config, decrypting the password when it was
- * stored encrypted. Returns a typed error instead of throwing so route handlers
- * can report it.
+ * stored encrypted. Legacy plaintext passwords are re-sealed in storage when an
+ * encryption key is configured so upgrades migrate without a re-save. Returns a
+ * typed error instead of throwing so route handlers can report it.
  */
 async function resolveQbitConfig(
   ctx: PluginContext,
@@ -136,36 +137,68 @@ async function resolveQbitConfig(
   if (!stored) {
     return { error: "Seedbox not configured", code: "not_configured" };
   }
+
+  const { credentialsEncrypted: _flag, ...storedConfig } = stored;
+  let resolved: QbitConfig = storedConfig;
+
   if (!stored.credentialsEncrypted) {
-    return stored;
+    if (stored.password) {
+      let key: ReturnType<typeof loadConfigKey>;
+      try {
+        key = loadConfigKey();
+      } catch (error) {
+        return {
+          error: error instanceof Error ? error.message : "Invalid seedbox key",
+          code: "invalid_config",
+        };
+      }
+      if (key) {
+        await ctx.storage.set(CONFIG_KEY, {
+          ...storedConfig,
+          password: encryptSecret(stored.password, key),
+          credentialsEncrypted: true,
+        });
+        ctx.logger.info(
+          "Migrated legacy plaintext seedbox credentials to encrypted storage",
+        );
+      }
+    }
+  } else {
+    let key: ReturnType<typeof loadConfigKey>;
+    try {
+      key = loadConfigKey();
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : "Invalid seedbox key",
+        code: "invalid_config",
+      };
+    }
+    if (!key) {
+      return {
+        error: `Seedbox credentials are encrypted; set ${SEEDBOX_CONFIG_KEY_ENV} to decrypt them`,
+        code: "invalid_config",
+      };
+    }
+    try {
+      resolved = {
+        ...storedConfig,
+        password: storedConfig.password
+          ? decryptSecret(storedConfig.password, key)
+          : undefined,
+      };
+    } catch {
+      return {
+        error: "Unable to decrypt stored seedbox credentials",
+        code: "invalid_config",
+      };
+    }
   }
-  let key: ReturnType<typeof loadConfigKey>;
-  try {
-    key = loadConfigKey();
-  } catch (error) {
-    return {
-      error: error instanceof Error ? error.message : "Invalid seedbox key",
-      code: "invalid_config",
-    };
+
+  const parsed = parseQbitBaseUrl(resolved.baseUrl);
+  if (!parsed.ok) {
+    return { error: parsed.error, code: "invalid_config" };
   }
-  if (!key) {
-    return {
-      error: `Seedbox credentials are encrypted; set ${SEEDBOX_CONFIG_KEY_ENV} to decrypt them`,
-      code: "invalid_config",
-    };
-  }
-  try {
-    const { credentialsEncrypted: _drop, ...rest } = stored;
-    return {
-      ...rest,
-      password: rest.password ? decryptSecret(rest.password, key) : undefined,
-    };
-  } catch {
-    return {
-      error: "Unable to decrypt stored seedbox credentials",
-      code: "invalid_config",
-    };
-  }
+  return { ...resolved, baseUrl: parsed.url };
 }
 
 export default class SeedboxPlugin implements ServerPlugin {  metadata = {
@@ -363,15 +396,20 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
           code: "unauthorized" as const,
         };
       }
-      const config = await resolveQbitConfig(ctx);
-      if ("error" in config) {
-        return config;
-      }
-      const client = this.clientFactory(config);
-      if (client.checkHealth) {
-        return { health: await client.checkHealth() };
-      }
       try {
+        const config = await resolveQbitConfig(ctx);
+        if ("error" in config) {
+          // A configured-but-invalid URL is reported in the health shape so
+          // this route never throws; not-configured/decrypt errors stay typed.
+          if (config.code !== "invalid_config") {
+            return config;
+          }
+          return this.healthUnreachable(config.error);
+        }
+        const client = this.clientFactory(config);
+        if (client.checkHealth) {
+          return { health: await client.checkHealth() };
+        }
         await client.login();
         return {
           health: {
@@ -382,15 +420,9 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
           },
         };
       } catch (error) {
-        return {
-          health: {
-            reachable: false,
-            authenticated: false,
-            checkedAt: Date.now(),
-            latencyMs: 0,
-            error: error instanceof Error ? error.message : "unknown error",
-          },
-        };
+        const message = error instanceof Error ? error.message : "unknown error";
+        ctx.logger.warn(`GET /health failed: ${message}`);
+        return this.healthUnreachable(message);
       }
     });
 
@@ -687,6 +719,18 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
 
   private errorEvent(error: QbitApiError): SeedboxErrorEvent {
     return { event: "error", ...error, time: Date.now() };
+  }
+
+  private healthUnreachable(error: string): { health: QbitConnectionHealth } {
+    return {
+      health: {
+        reachable: false,
+        authenticated: false,
+        checkedAt: Date.now(),
+        latencyMs: 0,
+        error,
+      },
+    };
   }
 
   private toApiError(

@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import {
   QBittorrentClient,
   QBittorrentError,
+  SEEDBOX_ALLOW_LOOPBACK_ENV,
   isRetryableQbitError,
   parseQbitBaseUrl,
+  validateQbitHost,
   withBackoff,
   type QbitConfig,
 } from "../src/qbittorrent.js";
@@ -528,5 +530,126 @@ test("parseQbitBaseUrl normalizes valid URLs and rejects unsafe ones", () => {
   assert.equal(parseQbitBaseUrl("javascript:alert(1)").ok, false);
   assert.equal(parseQbitBaseUrl("http://u:p@qbit.test").ok, false);
   assert.equal(parseQbitBaseUrl(123).ok, false);
+});
+
+test("validateQbitHost rejects loopback hosts by default and allows the opt-in", () => {
+  for (const host of [
+    "127.0.0.1",
+    "127.9.250.1",
+    "localhost",
+    "qbit.localhost",
+    "::1",
+    "[::1]",
+    "::ffff:127.0.0.1",
+  ]) {
+    const result = validateQbitHost(host);
+    assert.equal(result.ok, false, `${host} must be rejected by default`);
+    assert.match(
+      result.ok ? "" : result.error,
+      /loopback/,
+      `${host} must report a loopback rejection`,
+    );
+  }
+
+  assert.equal(validateQbitHost("127.0.0.1", { allowLoopback: true }).ok, true);
+  assert.equal(validateQbitHost("localhost", { allowLoopback: true }).ok, true);
+  assert.equal(validateQbitHost("[::1]", { allowLoopback: true }).ok, true);
+});
+
+test("validateQbitHost rejects link-local metadata hosts regardless of the loopback opt-in", () => {
+  for (const host of [
+    "169.254.169.254",
+    "169.254.0.1",
+    "fe80::1",
+    "fe80::abcd",
+    "::ffff:169.254.169.254",
+  ]) {
+    for (const allowLoopback of [false, true]) {
+      const result = validateQbitHost(host, { allowLoopback });
+      assert.equal(
+        result.ok,
+        false,
+        `${host} must be rejected (allowLoopback=${allowLoopback})`,
+      );
+      assert.match(
+        result.ok ? "" : result.error,
+        /link-local/,
+        `${host} must report a link-local rejection`,
+      );
+    }
+  }
+});
+
+test("validateQbitHost keeps RFC1918 and ULA hosts allowed by default", () => {
+  for (const host of [
+    "10.0.0.5",
+    "172.16.1.1",
+    "172.31.255.254",
+    "192.168.1.50",
+    "fd00::1",
+    "fd12:3456:789a::1",
+    "seedbox.example.com",
+    "qbit.local",
+  ]) {
+    assert.equal(validateQbitHost(host).ok, true, `${host} must be allowed`);
+  }
+});
+
+test("parseQbitBaseUrl applies the host policy with the SEEDBOX_ALLOW_LOOPBACK opt-in", () => {
+  const saved = process.env[SEEDBOX_ALLOW_LOOPBACK_ENV];
+  try {
+    delete process.env[SEEDBOX_ALLOW_LOOPBACK_ENV];
+    assert.equal(parseQbitBaseUrl("http://127.0.0.1:8080").ok, false);
+    assert.equal(parseQbitBaseUrl("http://localhost:8080").ok, false);
+    assert.equal(parseQbitBaseUrl("http://[::1]:8080").ok, false);
+    assert.equal(parseQbitBaseUrl("http://169.254.169.254/latest").ok, false);
+    assert.equal(parseQbitBaseUrl("http://[fe80::1]:8080").ok, false);
+
+    process.env[SEEDBOX_ALLOW_LOOPBACK_ENV] = "true";
+    assert.equal(parseQbitBaseUrl("http://127.0.0.1:8080").ok, true);
+    assert.equal(parseQbitBaseUrl("http://[::1]:8080").ok, true);
+    assert.equal(parseQbitBaseUrl("http://169.254.169.254/latest").ok, false);
+  } finally {
+    if (saved === undefined) {
+      delete process.env[SEEDBOX_ALLOW_LOOPBACK_ENV];
+    } else {
+      process.env[SEEDBOX_ALLOW_LOOPBACK_ENV] = saved;
+    }
+  }
+});
+
+test("parseQbitBaseUrl accepts RFC1918/ULA hosts and rejects metadata hosts", () => {
+  for (const url of [
+    "http://10.0.0.5:8080",
+    "http://172.16.1.1:8080",
+    "http://192.168.1.50:8080",
+    "http://[fd00::1]:8080",
+  ]) {
+    assert.equal(parseQbitBaseUrl(url).ok, true, `${url} must be allowed`);
+  }
+  for (const url of [
+    "http://169.254.169.254",
+    "http://[fe80::1]:8080",
+  ]) {
+    assert.equal(parseQbitBaseUrl(url).ok, false, `${url} must be rejected`);
+  }
+});
+
+test("constructor rejects non-routable hosts with invalid_config", () => {
+  for (const baseUrl of [
+    "http://127.0.0.1:8080",
+    "http://169.254.169.254",
+    "http://[fe80::1]",
+  ]) {
+    assert.throws(
+      () => new QBittorrentClient(baseConfig({ baseUrl })),
+      (error: unknown) => {
+        assert.ok(error instanceof QBittorrentError);
+        assert.equal(error.code, "invalid_config");
+        return true;
+      },
+      `expected ${JSON.stringify(baseUrl)} to be rejected`,
+    );
+  }
 });
 

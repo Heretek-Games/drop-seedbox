@@ -14,7 +14,7 @@ Maintained by [Heretek Games](https://github.com/Heretek-Games/drop-seedbox).
   - `POST /api/v2/torrents/add` (magnet/URL as form data, `.torrent` as multipart), `pause`/`resume`/`delete` actions, and `GET /api/v2/transfer/info`.
   - `checkHealth()` connection probe (reachability, authentication, latency) that never throws.
 - **Plugin routes** (`src/index.ts`):
-  - `POST /config` — authenticated; validates the WebUI `baseUrl` (absolute `http(s)`, no embedded credentials), stores `baseUrl`/credentials (encrypting the password, see below), and resets cached sessions.
+  - `POST /config` — authenticated; validates the WebUI `baseUrl` (absolute `http(s)`, no embedded credentials, loopback/link-local hosts rejected by default), stores `baseUrl`/credentials (encrypting the password, see below), and resets cached sessions.
   - `GET /torrents` — authenticated; returns `{ torrents }` or a typed `{ error, code }` response; client failures never surface as unhandled rejections.
   - `POST /torrents` — authenticated; adds a torrent from a magnet/URL or base64 `.torrent` (`url`, `torrentFile`, `torrentFileName`, `savePath`, `category`, `paused`).
   - `POST /torrents/:hash/pause`, `POST /torrents/:hash/resume`, `DELETE /torrents/:hash` — authenticated; `deleteFiles` is honored on delete.
@@ -30,7 +30,7 @@ The repository name and earlier docs referenced remote streaming depots and game
 
 - Remote / mountable streaming depots (Heretek-Games/drop-seedbox#3, #4) — the depot registry, health probe and validation exist, but no torrent-backed chunk backend
 - Play-while-download streaming (Heretek-Games/drop-seedbox#5)
-- SSRF host allowlisting and rate limits (Heretek-Games/drop-seedbox#6; scheme/host validation and embedded-credential rejection are implemented, but arbitrary private-range hosts are still permitted)
+- SSRF request rate limiting (Heretek-Games/drop-seedbox#6) — scheme/host validation, embedded-credential rejection, and loopback/link-local host blocking are implemented; RFC1918/ULA LAN hosts remain allowed by design, and throttling is not implemented
 - Admin UI (Heretek-Games/drop-seedbox#7 — the health/depot monitoring backend is in place; a rendered admin page is not)
 
 Progress updates are polled snapshots of the torrent list, not byte-level or per-peer real-time telemetry.
@@ -39,8 +39,8 @@ Progress updates are polled snapshots of the torrent list, not byte-level or per
 
 - Credentials and session cookies (`SID`) are never logged. Error messages and log lines contain only status codes and error classifications.
 - Every route (`/config`, `/torrents`, `/transfer`, `/health`, `/depots`, `/mappings`) requires an authenticated `userId`; unauthenticated callers receive `{ error, code: "unauthorized" }`.
-- The qBittorrent password is never persisted in plaintext. Set `DROP_SEEDBOX_CONFIG_KEY` (32 bytes as 64 hex characters or base64) to enable credential storage; `POST /config` refuses to store a password without it. Stored passwords are encrypted with AES-256-GCM.
-- `baseUrl` must be an absolute `http(s)` URL without embedded credentials.
+- The qBittorrent password is never persisted in plaintext. Set `DROP_SEEDBOX_CONFIG_KEY` (32 bytes as 64 hex characters or base64) to enable credential storage; `POST /config` refuses to store a password without it. Stored passwords are encrypted with AES-256-GCM, and legacy plaintext rows are re-encrypted in storage on first read once the key is configured.
+- `baseUrl` must be an absolute `http(s)` URL without embedded credentials. Loopback (`127.0.0.0/8`, `::1`, `localhost`) and link-local (`169.254.0.0/16`, `fe80::/10`) hosts are rejected; set `SEEDBOX_ALLOW_LOOPBACK=true` to opt in to loopback test setups. RFC1918 and ULA (`fc00::/7`) LAN hosts remain allowed, since LAN seedboxes are the primary use case.
 - Outbound requests send a `Referer`/`Origin` matching the WebUI host (required by some qBittorrent CSRF configurations).
 - `seedbox:progress` subscriptions require an authenticated `userId`; anonymous subscribers are rejected by the registered subscription authorizer and by the handler.
 - Outbound requests are bounded by a per-request timeout and retried with backoff so unreachable seedboxes cannot pin handlers indefinitely.

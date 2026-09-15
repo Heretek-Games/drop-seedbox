@@ -2,10 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MockPluginContext } from "@droposs/plugin-sdk";
 import SeedboxPlugin, {
+  SEEDBOX_ALLOW_LOOPBACK_ENV,
   SEEDBOX_PROGRESS_CHANNEL,
   type SeedboxClient,
 } from "../src/index.js";
 import { QBittorrentError, type QbitTorrent } from "../src/qbittorrent.js";
+import { decryptSecret, loadConfigKey } from "../src/secrets.js";
 
 process.env.DROP_SEEDBOX_CONFIG_KEY =
   "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -561,6 +563,191 @@ test("health reports not_configured then a probe result", async () => {
   assert.equal(probe.health.authenticated, true);
 
   await plugin.teardown();
+});
+
+test("GET /health returns a typed unreachable result for a legacy invalid baseUrl", async () => {
+  const plugin = makePlugin({ client: fakeClient() });
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+
+  const health = ctx.routes.get("GET /health");
+  assert.ok(health);
+
+  const cases: Array<[string, RegExp]> = [
+    ["qbit.local:8080", /http or https scheme/],
+    ["://bad", /absolute http\(s\) URL/],
+    ["http://127.0.0.1:8080", /loopback/],
+    ["http://169.254.169.254", /link-local/],
+  ];
+  for (const [baseUrl, expected] of cases) {
+    await ctx.storage.set("qbit_config", {
+      baseUrl,
+      username: "admin",
+      password: "password123",
+    });
+    const res = (await health.handler({} as any, {
+      params: {},
+      query: {},
+      userId: "u1",
+    })) as any;
+
+    assert.equal(res.health?.reachable, false, `${baseUrl} must be unreachable`);
+    assert.equal(res.health?.authenticated, false, baseUrl);
+    assert.equal(typeof res.health?.error, "string", baseUrl);
+    assert.match(res.health.error, expected, baseUrl);
+  }
+
+  await plugin.teardown();
+});
+
+test("GET /health does not throw when client creation fails", async () => {
+  const plugin = new SeedboxPlugin({
+    clientFactory: () => {
+      throw new QBittorrentError("invalid legacy baseUrl", {
+        code: "invalid_config",
+      });
+    },
+  });
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+  await ctx.storage.set("qbit_config", {
+    baseUrl: "http://192.168.1.50:8080",
+    username: "admin",
+    password: "password123",
+  });
+
+  const health = ctx.routes.get("GET /health");
+  assert.ok(health);
+  const res = (await health.handler({} as any, {
+    params: {},
+    query: {},
+    userId: "u1",
+  })) as any;
+
+  assert.equal(res.health.reachable, false);
+  assert.equal(res.health.authenticated, false);
+  assert.match(res.health.error, /invalid legacy baseUrl/);
+
+  await plugin.teardown();
+});
+
+test("legacy plaintext credentials are re-sealed in storage on read", async () => {
+  const plugin = makePlugin({ client: fakeClient() });
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+  await ctx.storage.set("qbit_config", {
+    baseUrl: "http://192.168.1.50:8080",
+    username: "admin",
+    password: "legacy-password",
+  });
+
+  const torrents = ctx.routes.get("GET /torrents");
+  assert.ok(torrents);
+  const res = (await torrents.handler({} as any, {
+    params: {},
+    query: {},
+    userId: "u1",
+  })) as any;
+  assert.deepEqual(res.torrents, TORRENTS);
+
+  const stored = await ctx.storage.get<any>("qbit_config");
+  assert.ok(stored);
+  assert.equal(stored.credentialsEncrypted, true);
+  assert.notEqual(stored.password, "legacy-password");
+  assert.match(stored.password, /^v1:/);
+
+  const key = loadConfigKey();
+  assert.ok(key, "the test encryption key must be configured");
+  assert.equal(decryptSecret(stored.password, key), "legacy-password");
+
+  await plugin.teardown();
+});
+
+test("legacy plaintext credentials still resolve when no key is configured", async () => {
+  const saved = process.env.DROP_SEEDBOX_CONFIG_KEY;
+  delete process.env.DROP_SEEDBOX_CONFIG_KEY;
+  try {
+    const plugin = makePlugin({ client: fakeClient() });
+    const ctx = makeCtx();
+    await plugin.init(ctx);
+    await ctx.storage.set("qbit_config", {
+      baseUrl: "http://192.168.1.50:8080",
+      username: "admin",
+      password: "legacy-password",
+    });
+
+    const torrents = ctx.routes.get("GET /torrents");
+    assert.ok(torrents);
+    const res = (await torrents.handler({} as any, {
+      params: {},
+      query: {},
+      userId: "u1",
+    })) as any;
+    assert.deepEqual(res.torrents, TORRENTS);
+
+    // Without a key the legacy row is left untouched (reads never write
+    // plaintext, and there is nothing to encrypt with).
+    const stored = await ctx.storage.get<any>("qbit_config");
+    assert.equal(stored.password, "legacy-password");
+    assert.notEqual(stored.credentialsEncrypted, true);
+
+    await plugin.teardown();
+  } finally {
+    process.env.DROP_SEEDBOX_CONFIG_KEY = saved;
+  }
+});
+
+test("POST /config enforces the SSRF host policy with a loopback opt-in", async () => {
+  const saved = process.env[SEEDBOX_ALLOW_LOOPBACK_ENV];
+  delete process.env[SEEDBOX_ALLOW_LOOPBACK_ENV];
+  try {
+    const plugin = makePlugin();
+    const ctx = makeCtx();
+    await plugin.init(ctx);
+    const config = ctx.routes.get("POST /config");
+    assert.ok(config);
+    const routeCtx = { params: {}, query: {}, userId: "u1" };
+    const bodyFor = (baseUrl: string) => ({
+      baseUrl,
+      username: "admin",
+      password: "password123",
+    });
+
+    const loopback = (await config.handler(
+      { body: bodyFor("http://127.0.0.1:8080") } as any,
+      routeCtx,
+    )) as any;
+    assert.equal(loopback.code, "invalid_config");
+    assert.match(loopback.error, /loopback/);
+
+    const linkLocal = (await config.handler(
+      { body: bodyFor("http://169.254.169.254") } as any,
+      routeCtx,
+    )) as any;
+    assert.equal(linkLocal.code, "invalid_config");
+    assert.match(linkLocal.error, /link-local/);
+
+    const lan = (await config.handler(
+      { body: bodyFor("http://192.168.1.50:8080") } as any,
+      routeCtx,
+    )) as any;
+    assert.equal(lan.success, true);
+
+    process.env[SEEDBOX_ALLOW_LOOPBACK_ENV] = "true";
+    const optIn = (await config.handler(
+      { body: bodyFor("http://localhost:8080") } as any,
+      routeCtx,
+    )) as any;
+    assert.equal(optIn.success, true);
+
+    await plugin.teardown();
+  } finally {
+    if (saved === undefined) {
+      delete process.env[SEEDBOX_ALLOW_LOOPBACK_ENV];
+    } else {
+      process.env[SEEDBOX_ALLOW_LOOPBACK_ENV] = saved;
+    }
+  }
 });
 
 test("depot registry requires auth and orders by priority", async () => {

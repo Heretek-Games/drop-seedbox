@@ -15,7 +15,8 @@
 
 ## 2. Invariants
 
-- **Credential Security**: Never log passwords or session cookies (`SID`); never persist the password in plaintext (encrypt with `DROP_SEEDBOX_CONFIG_KEY` via `src/secrets.ts`).
+- **Credential Security**: Never log passwords or session cookies (`SID`); never persist the password in plaintext (encrypt with `DROP_SEEDBOX_CONFIG_KEY` via `src/secrets.ts`; legacy plaintext rows are re-sealed on read).
 - **Authorization**: Every route requires an authenticated `userId`; return `{ error, code: "unauthorized" }` otherwise.
+- **SSRF Host Policy**: `baseUrl` hosts are checked by `validateQbitHost` (`src/qbittorrent.ts`); loopback and link-local/metadata hosts are rejected by default (`SEEDBOX_ALLOW_LOOPBACK=true` opts loopback back in), while RFC1918/ULA LAN hosts stay allowed.
 - **Resilient Polling**: Implement backoff on unreachable seedbox endpoints; every request carries a timeout and re-authenticates on 401/403.
-- **Typed Failures**: Routes and WS handlers return typed `{ error, code }` responses instead of unhandled rejections.
+- **Typed Failures**: Routes and WS handlers return typed `{ error, code }` responses instead of unhandled rejections (including `GET /health`, which always reports a health object for configured-but-invalid configs).
