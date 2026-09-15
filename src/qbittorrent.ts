@@ -106,13 +106,14 @@ function ipv4Octets(host: string): number[] | null {
 function ipv6Groups(host: string): number[] | null {
   if (!host.includes(":")) return null;
   let address = host;
-  const embedded = host.match(/(\d+\.\d+\.\d+\.\d+)$/);
-  if (embedded) {
-    const octets = ipv4Octets(embedded[1]);
+  const lastColon = host.lastIndexOf(":");
+  const lastGroup = lastColon === -1 ? host : host.slice(lastColon + 1);
+  if (lastGroup.includes(".")) {
+    const octets = ipv4Octets(lastGroup);
     if (!octets) return null;
     const hi = ((octets[0] << 8) | octets[1]).toString(16);
     const lo = ((octets[2] << 8) | octets[3]).toString(16);
-    address = `${address.slice(0, embedded.index)}${hi}:${lo}`;
+    address = `${host.slice(0, lastColon + 1)}${hi}:${lo}`;
   }
   const [headPart, tailPart, ...extra] = address.split("::");
   if (extra.length > 0) return null;
@@ -121,7 +122,9 @@ function ipv6Groups(host: string): number[] | null {
     const groups = part
       .split(":")
       .map((group) =>
-        /^[0-9a-f]{1,4}$/i.test(group) ? Number.parseInt(group, 16) : Number.NaN,
+        /^[0-9a-f]{1,4}$/i.test(group)
+          ? Number.parseInt(group, 16)
+          : Number.NaN,
       );
     return groups.some((group) => Number.isNaN(group)) ? null : groups;
   };
@@ -201,7 +204,7 @@ export function validateQbitHost(
   }
   const allowLoopback =
     policy.allowLoopback ??
-    (process.env[SEEDBOX_ALLOW_LOOPBACK_ENV]?.trim().toLowerCase() === "true");
+    process.env[SEEDBOX_ALLOW_LOOPBACK_ENV]?.trim().toLowerCase() === "true";
   if (!allowLoopback && isLoopbackHostname(host)) {
     return {
       ok: false,
@@ -242,7 +245,8 @@ export function parseQbitBaseUrl(
   }
   const hostCheck = validateQbitHost(parsed.hostname, policy);
   if (!hostCheck.ok) return hostCheck;
-  const url = parsed.toString().replace(/\/+$/, "");
+  let url = parsed.toString();
+  while (url.endsWith("/")) url = url.slice(0, -1);
   return { ok: true, url, origin: parsed.origin };
 }
 
@@ -318,7 +322,8 @@ export async function withBackoff<T>(
   const maxDelayMs = options.maxDelayMs ?? DEFAULT_BACKOFF_MAX_MS;
   const retryable = options.isRetryable ?? isRetryableQbitError;
   const sleep =
-    options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    options.sleep ??
+    ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -440,15 +445,14 @@ export class QBittorrentClient {
   /** Add a torrent from a magnet/URL or raw `.torrent` file. */
   async addTorrent(options: QbitAddTorrentOptions): Promise<void> {
     if (!options.url && !options.torrentFile) {
-      throw new QBittorrentError(
-        "addTorrent requires a url or torrentFile",
-        { code: "invalid_response" },
-      );
+      throw new QBittorrentError("addTorrent requires a url or torrentFile", {
+        code: "invalid_response",
+      });
     }
-    await withBackoff(
-      () => this.sendTorrentAdd(options),
-      { maxRetries: this.maxRetries, baseDelayMs: this.backoffBaseMs },
-    );
+    await withBackoff(() => this.sendTorrentAdd(options), {
+      maxRetries: this.maxRetries,
+      baseDelayMs: this.backoffBaseMs,
+    });
   }
 
   /** Pause one or more torrents by hash. */
@@ -481,11 +485,7 @@ export class QBittorrentClient {
     return withBackoff(
       async () => {
         const payload = await this.getJson<unknown>("/api/v2/transfer/info");
-        if (
-          !payload ||
-          typeof payload !== "object" ||
-          Array.isArray(payload)
-        ) {
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
           throw new QBittorrentError(
             "qBittorrent returned an unexpected transfer payload",
             { code: "invalid_response" },
@@ -544,7 +544,10 @@ export class QBittorrentClient {
   }
 
   private async fetchTorrents(allowRelogin = true): Promise<QbitTorrent[]> {
-    const payload = await this.getJson<unknown>("/api/v2/torrents/info", allowRelogin);
+    const payload = await this.getJson<unknown>(
+      "/api/v2/torrents/info",
+      allowRelogin,
+    );
     if (!Array.isArray(payload)) {
       throw new QBittorrentError(
         "qBittorrent returned an unexpected torrents payload",
