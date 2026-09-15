@@ -44,11 +44,13 @@ function makeCtx(): MockPluginContext {
   ]);
 }
 
-function fakeClient(options: {
-  torrents?: QbitTorrent[];
-  loginError?: Error;
-  torrentsError?: Error;
-} = {}): SeedboxClient {
+function fakeClient(
+  options: {
+    torrents?: QbitTorrent[];
+    loginError?: Error;
+    torrentsError?: Error;
+  } = {},
+): SeedboxClient {
   return {
     async login(): Promise<void> {
       if (options.loginError) throw options.loginError;
@@ -101,7 +103,10 @@ async function makeWsHarness(
     await ctx.storage.set("qbit_config", { ...CONFIG });
   }
   const progressWs = ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL);
-  assert.ok(progressWs, "seedbox:progress websocket handler must be registered");
+  assert.ok(
+    progressWs,
+    "seedbox:progress websocket handler must be registered",
+  );
   const sent: any[] = [];
   const send = (data: unknown) => {
     sent.push(data);
@@ -132,7 +137,11 @@ test("SeedboxPlugin registers routes/WS/authorizers and enforces auth on config"
     "seedbox:progress websocket handler must be registered",
   );
 
-  assert.equal(ctx.authorizers.length, 1, "a subscription authorizer is registered");
+  assert.equal(
+    ctx.authorizers.length,
+    1,
+    "a subscription authorizer is registered",
+  );
   const authorizer = ctx.authorizers[0];
   assert.equal(authorizer.matches(SEEDBOX_PROGRESS_CHANNEL), true);
   assert.equal(authorizer.matches("other:channel"), false);
@@ -363,7 +372,10 @@ test("seedbox:progress broadcasts periodic updates to subscribers", async () => 
 
   const progressWs = ctx.wsHandlers.get(SEEDBOX_PROGRESS_CHANNEL);
   assert.ok(progressWs);
-  await progressWs({ type: "subscribe" }, { userId: "admin-1", send: () => {} });
+  await progressWs(
+    { type: "subscribe" },
+    { userId: "admin-1", send: () => {} },
+  );
 
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.ok(
@@ -421,7 +433,12 @@ function recordingClient(calls: RecordedCalls): SeedboxClient {
 }
 
 test("torrent management routes require auth and call the client", async () => {
-  const calls: RecordedCalls = { added: [], paused: [], resumed: [], deleted: [] };
+  const calls: RecordedCalls = {
+    added: [],
+    paused: [],
+    resumed: [],
+    deleted: [],
+  };
   const plugin = makePlugin({ client: recordingClient(calls) });
   const ctx = makeCtx();
   await plugin.init(ctx);
@@ -461,12 +478,20 @@ test("torrent management routes require auth and call the client", async () => {
 
   const pause = ctx.routes.get("POST /torrents/:hash/pause");
   assert.ok(pause);
-  await pause.handler({} as any, { params: { hash: "abc" }, query: {}, userId: "u1" });
+  await pause.handler({} as any, {
+    params: { hash: "abc" },
+    query: {},
+    userId: "u1",
+  });
   assert.deepEqual(calls.paused, [["abc"]]);
 
   const resume = ctx.routes.get("POST /torrents/:hash/resume");
   assert.ok(resume);
-  await resume.handler({} as any, { params: { hash: "abc" }, query: {}, userId: "u1" });
+  await resume.handler({} as any, {
+    params: { hash: "abc" },
+    query: {},
+    userId: "u1",
+  });
   assert.deepEqual(calls.resumed, [["abc"]]);
 
   const del = ctx.routes.get("DELETE /torrents/:hash");
@@ -498,11 +523,14 @@ test("mapping routes associate torrents and games", async () => {
   const create = ctx.routes.get("POST /mappings");
   assert.ok(create, "POST /mappings must be registered");
 
-  const unauth = (await create.handler({ body: { gameId: "g1", hash: "h1" } } as any, {
-    params: {},
-    query: {},
-    userId: undefined,
-  })) as any;
+  const unauth = (await create.handler(
+    { body: { gameId: "g1", hash: "h1" } } as any,
+    {
+      params: {},
+      query: {},
+      userId: undefined,
+    },
+  )) as any;
   assert.equal(unauth.error, "Authentication required to configure mappings");
 
   const missing = (await create.handler({ body: { gameId: "g1" } } as any, {
@@ -527,13 +555,11 @@ test("mapping routes associate torrents and games", async () => {
     })) as any;
   assert.equal(byGame.mapping.hash, "h1");
 
-  const byHash = (await ctx.routes
-    .get("GET /mappings")!
-    .handler({} as any, {
-      params: {},
-      query: { hash: "h1" },
-      userId: "u1",
-    })) as any;
+  const byHash = (await ctx.routes.get("GET /mappings")!.handler({} as any, {
+    params: {},
+    query: { hash: "h1" },
+    userId: "u1",
+  })) as any;
   assert.equal(byHash.mapping.gameId, "g1");
 
   await plugin.teardown();
@@ -591,7 +617,11 @@ test("GET /health returns a typed unreachable result for a legacy invalid baseUr
       userId: "u1",
     })) as any;
 
-    assert.equal(res.health?.reachable, false, `${baseUrl} must be unreachable`);
+    assert.equal(
+      res.health?.reachable,
+      false,
+      `${baseUrl} must be unreachable`,
+    );
     assert.equal(res.health?.authenticated, false, baseUrl);
     assert.equal(typeof res.health?.error, "string", baseUrl);
     assert.match(res.health.error, expected, baseUrl);
@@ -631,7 +661,10 @@ test("GET /health does not throw when client creation fails", async () => {
   await plugin.teardown();
 });
 
-test("legacy plaintext credentials are re-sealed in storage on read", async () => {
+async function seedLegacyCredentials(): Promise<{
+  plugin: SeedboxPlugin;
+  ctx: MockPluginContext;
+}> {
   const plugin = makePlugin({ client: fakeClient() });
   const ctx = makeCtx();
   await plugin.init(ctx);
@@ -640,15 +673,24 @@ test("legacy plaintext credentials are re-sealed in storage on read", async () =
     username: "admin",
     password: "legacy-password",
   });
+  return { plugin, ctx };
+}
 
-  const torrents = ctx.routes.get("GET /torrents");
-  assert.ok(torrents);
-  const res = (await torrents.handler({} as any, {
+async function requestTorrents(ctx: MockPluginContext): Promise<any> {
+  const route = ctx.routes.get("GET /torrents");
+  assert.ok(route);
+  const res = (await route.handler({} as any, {
     params: {},
     query: {},
     userId: "u1",
   })) as any;
   assert.deepEqual(res.torrents, TORRENTS);
+  return res;
+}
+
+test("legacy plaintext credentials are re-sealed in storage on read", async () => {
+  const { plugin, ctx } = await seedLegacyCredentials();
+  await requestTorrents(ctx);
 
   const stored = await ctx.storage.get<any>("qbit_config");
   assert.ok(stored);
@@ -667,23 +709,8 @@ test("legacy plaintext credentials still resolve when no key is configured", asy
   const saved = process.env.DROP_SEEDBOX_CONFIG_KEY;
   delete process.env.DROP_SEEDBOX_CONFIG_KEY;
   try {
-    const plugin = makePlugin({ client: fakeClient() });
-    const ctx = makeCtx();
-    await plugin.init(ctx);
-    await ctx.storage.set("qbit_config", {
-      baseUrl: "http://192.168.1.50:8080",
-      username: "admin",
-      password: "legacy-password",
-    });
-
-    const torrents = ctx.routes.get("GET /torrents");
-    assert.ok(torrents);
-    const res = (await torrents.handler({} as any, {
-      params: {},
-      query: {},
-      userId: "u1",
-    })) as any;
-    assert.deepEqual(res.torrents, TORRENTS);
+    const { plugin, ctx } = await seedLegacyCredentials();
+    await requestTorrents(ctx);
 
     // Without a key the legacy row is left untouched (reads never write
     // plaintext, and there is nothing to encrypt with).
@@ -774,16 +801,22 @@ test("depot registry requires auth and orders by priority", async () => {
   })) as any;
   assert.equal(missing.error, "id and endpoint are required");
 
-  await create.handler({ body: { id: "b", endpoint: "http://b", priority: 200 } } as any, {
-    params: {},
-    query: {},
-    userId: "u1",
-  });
-  await create.handler({ body: { id: "a", endpoint: "http://a", priority: 10 } } as any, {
-    params: {},
-    query: {},
-    userId: "u1",
-  });
+  await create.handler(
+    { body: { id: "b", endpoint: "http://b", priority: 200 } } as any,
+    {
+      params: {},
+      query: {},
+      userId: "u1",
+    },
+  );
+  await create.handler(
+    { body: { id: "a", endpoint: "http://a", priority: 10 } } as any,
+    {
+      params: {},
+      query: {},
+      userId: "u1",
+    },
+  );
 
   const listed = (await list.handler({} as any, {
     params: {},

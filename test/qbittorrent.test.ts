@@ -36,6 +36,19 @@ function loginOk(cookie = "SID=session-token"): Response {
   });
 }
 
+function recordingFetch(respond: (url: string) => Response): {
+  fetchFn: typeof fetch;
+  requests: Array<{ url: string; init?: RequestInit }>;
+} {
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const fetchFn = (async (url: string | URL, init?: RequestInit) => {
+    requests.push({ url: String(url), init });
+    if (String(url).endsWith("/api/v2/auth/login")) return loginOk();
+    return respond(String(url));
+  }) as typeof fetch;
+  return { fetchFn, requests };
+}
+
 function baseConfig(overrides: Partial<QbitConfig> = {}): QbitConfig {
   return {
     baseUrl: "http://qbit.test:8080/",
@@ -88,7 +101,8 @@ test("login rejects non-OK HTTP responses with status", async () => {
 test("login rejects a Fails. body even when HTTP is 200", async () => {
   const client = new QBittorrentClient(
     baseConfig({
-      fetchFn: (async () => new Response("Fails.", { status: 200 })) as typeof fetch,
+      fetchFn: (async () =>
+        new Response("Fails.", { status: 200 })) as typeof fetch,
     }),
   );
 
@@ -100,12 +114,7 @@ test("login rejects a Fails. body even when HTTP is 200", async () => {
 });
 
 test("login stores the SID cookie and getTorrents sends it", async () => {
-  const requests: Array<{ url: string; init?: RequestInit }> = [];
-  const fetchFn = (async (url: string | URL, init?: RequestInit) => {
-    requests.push({ url: String(url), init });
-    if (String(url).endsWith("/api/v2/auth/login")) return loginOk();
-    return jsonResponse(TORRENTS);
-  }) as typeof fetch;
+  const { fetchFn, requests } = recordingFetch(() => jsonResponse(TORRENTS));
 
   const client = new QBittorrentClient(baseConfig({ fetchFn }));
   await client.login();
@@ -127,7 +136,10 @@ test("getTorrents surfaces HTTP failures as http_error", async () => {
   const client = new QBittorrentClient(
     baseConfig({
       fetchFn: (async () =>
-        new Response("boom", { status: 500, statusText: "Internal Server Error" })) as typeof fetch,
+        new Response("boom", {
+          status: 500,
+          statusText: "Internal Server Error",
+        })) as typeof fetch,
     }),
   );
 
@@ -434,7 +446,10 @@ test("addTorrent uploads a .torrent file as multipart", async () => {
   });
 
   const add = requests.find((r) => r.url.endsWith("/api/v2/torrents/add"));
-  assert.ok(add?.init?.body instanceof FormData, "body must be multipart form data");
+  assert.ok(
+    add?.init?.body instanceof FormData,
+    "body must be multipart form data",
+  );
   const form = add.init?.body as FormData;
   assert.equal(form.get("savepath"), "/srv/games");
   assert.ok(form.get("torrents") instanceof Blob);
@@ -452,11 +467,8 @@ test("addTorrent rejects an empty request", async () => {
 });
 
 test("pause/resume/delete and transfer use the documented endpoints", async () => {
-  const requests: Array<{ url: string; init?: RequestInit }> = [];
-  const fetchFn = (async (url: string | URL, init?: RequestInit) => {
-    requests.push({ url: String(url), init });
-    if (String(url).endsWith("/api/v2/auth/login")) return loginOk();
-    if (String(url).endsWith("/api/v2/transfer/info")) {
+  const { fetchFn, requests } = recordingFetch((url) => {
+    if (url.endsWith("/api/v2/transfer/info")) {
       return jsonResponse({
         dl_info_speed: 1,
         up_info_speed: 2,
@@ -466,7 +478,7 @@ test("pause/resume/delete and transfer use the documented endpoints", async () =
       });
     }
     return new Response("Ok.", { status: 200 });
-  }) as typeof fetch;
+  });
 
   const client = new QBittorrentClient(baseConfig({ fetchFn }));
   await client.login();
@@ -483,12 +495,7 @@ test("pause/resume/delete and transfer use the documented endpoints", async () =
 });
 
 test("requests carry Origin and Referer matching the base URL", async () => {
-  const requests: Array<{ url: string; init?: RequestInit }> = [];
-  const fetchFn = (async (url: string | URL, init?: RequestInit) => {
-    requests.push({ url: String(url), init });
-    if (String(url).endsWith("/api/v2/auth/login")) return loginOk();
-    return jsonResponse(TORRENTS);
-  }) as typeof fetch;
+  const { fetchFn, requests } = recordingFetch(() => jsonResponse(TORRENTS));
 
   const client = new QBittorrentClient(baseConfig({ fetchFn }));
   await client.login();
@@ -627,10 +634,7 @@ test("parseQbitBaseUrl accepts RFC1918/ULA hosts and rejects metadata hosts", ()
   ]) {
     assert.equal(parseQbitBaseUrl(url).ok, true, `${url} must be allowed`);
   }
-  for (const url of [
-    "http://169.254.169.254",
-    "http://[fe80::1]:8080",
-  ]) {
+  for (const url of ["http://169.254.169.254", "http://[fe80::1]:8080"]) {
     assert.equal(parseQbitBaseUrl(url).ok, false, `${url} must be rejected`);
   }
 });
@@ -652,4 +656,3 @@ test("constructor rejects non-routable hosts with invalid_config", () => {
     );
   }
 });
-
