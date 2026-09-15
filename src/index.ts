@@ -6,6 +6,7 @@ import type {
 import {
   QBittorrentClient,
   QBittorrentError,
+  parseQbitBaseUrl,
   withBackoff,
   type QbitAddTorrentOptions,
   type QbitConfig,
@@ -14,8 +15,15 @@ import {
   type QbitTorrent,
   type QbitTransferInfo,
 } from "./qbittorrent.js";
+import {
+  SEEDBOX_CONFIG_KEY_ENV,
+  decryptSecret,
+  encryptSecret,
+  loadConfigKey,
+} from "./secrets.js";
 
 export * from "./qbittorrent.js";
+export * from "./secrets.js";
 
 export const SEEDBOX_PROGRESS_CHANNEL = "seedbox:progress";
 export const DEFAULT_PROGRESS_INTERVAL_MS = 15_000;
@@ -56,10 +64,7 @@ export const SEEDBOX_MAPPING_GAME_PREFIX = "mapping:game:";
 export const SEEDBOX_MAPPING_HASH_PREFIX = "mapping:hash:";
 
 export type QbitApiErrorCode =
-  | QbitErrorCode
-  | "not_configured"
-  | "unauthorized"
-  | "unknown";
+  QbitErrorCode | "not_configured" | "unauthorized" | "unknown";
 
 export interface QbitApiError {
   error: string;
@@ -109,7 +114,123 @@ async function readDepots(ctx: PluginContext): Promise<SeedboxDepot[]> {
   return (await ctx.storage.get<SeedboxDepot[]>(SEEDBOX_DEPOTS_KEY)) ?? [];
 }
 
-export default class SeedboxPlugin implements ServerPlugin {  metadata = {
+/** Persisted config shape: the password may be stored as ciphertext. */
+interface StoredQbitConfig extends QbitConfig {
+  credentialsEncrypted?: boolean;
+}
+
+const CONFIG_KEY = "qbit_config";
+
+/**
+ * Load the persisted qBittorrent config, decrypting the password when it was
+ * stored encrypted. Legacy plaintext passwords are re-sealed in storage when an
+ * encryption key is configured so upgrades migrate without a re-save. Returns a
+ * typed error instead of throwing so route handlers can report it.
+ */
+/** Load the optional config encryption key, converting throws to a typed error. */
+function readConfigKey():
+  | { ok: true; key: ReturnType<typeof loadConfigKey> }
+  | { ok: false; error: QbitApiError } {
+  try {
+    return { ok: true, key: loadConfigKey() };
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        error: error instanceof Error ? error.message : "Invalid seedbox key",
+        code: "invalid_config",
+      },
+    };
+  }
+}
+
+/** Re-seal legacy plaintext credentials once a key is configured. */
+async function migrateLegacyCredentials(
+  ctx: PluginContext,
+  stored: StoredQbitConfig,
+  storedConfig: QbitConfig,
+): Promise<QbitApiError | undefined> {
+  if (stored.credentialsEncrypted || !stored.password) return undefined;
+  const keyResult = readConfigKey();
+  if (!keyResult.ok) return keyResult.error;
+  if (!keyResult.key) return undefined;
+
+  await ctx.storage.set(CONFIG_KEY, {
+    ...storedConfig,
+    password: encryptSecret(stored.password, keyResult.key),
+    credentialsEncrypted: true,
+  });
+  ctx.logger.info(
+    "Migrated legacy plaintext seedbox credentials to encrypted storage",
+  );
+  return undefined;
+}
+
+/** Decrypt stored credentials, converting failures to a typed error. */
+function decryptStoredCredentials(
+  storedConfig: QbitConfig,
+  key: NonNullable<ReturnType<typeof loadConfigKey>>,
+): { config?: QbitConfig; error?: QbitApiError } {
+  try {
+    return {
+      config: {
+        ...storedConfig,
+        password: storedConfig.password
+          ? decryptSecret(storedConfig.password, key)
+          : undefined,
+      },
+    };
+  } catch {
+    return {
+      error: {
+        error: "Unable to decrypt stored seedbox credentials",
+        code: "invalid_config",
+      },
+    };
+  }
+}
+
+async function resolveQbitConfig(
+  ctx: PluginContext,
+): Promise<QbitConfig | QbitApiError> {
+  const stored = await ctx.storage.get<StoredQbitConfig>(CONFIG_KEY);
+  if (!stored) {
+    return { error: "Seedbox not configured", code: "not_configured" };
+  }
+
+  const { credentialsEncrypted: _flag, ...storedConfig } = stored;
+  let resolved: QbitConfig = storedConfig;
+
+  if (!stored.credentialsEncrypted) {
+    const migrationError = await migrateLegacyCredentials(
+      ctx,
+      stored,
+      storedConfig,
+    );
+    if (migrationError) return migrationError;
+  } else {
+    const keyResult = readConfigKey();
+    if (!keyResult.ok) return keyResult.error;
+    if (!keyResult.key) {
+      return {
+        error: `Seedbox credentials are encrypted; set ${SEEDBOX_CONFIG_KEY_ENV} to decrypt them`,
+        code: "invalid_config",
+      };
+    }
+    const decrypted = decryptStoredCredentials(storedConfig, keyResult.key);
+    if (decrypted.error) return decrypted.error;
+    resolved = decrypted.config!;
+  }
+
+  const parsed = parseQbitBaseUrl(resolved.baseUrl);
+  if (!parsed.ok) {
+    return { error: parsed.error, code: "invalid_config" };
+  }
+  return { ...resolved, baseUrl: parsed.url };
+}
+
+export default class SeedboxPlugin implements ServerPlugin {
+  metadata = {
     id: "drop-seedbox",
     name: "Seedbox & qBittorrent Depot Provider",
     version: "0.1.0",
@@ -141,14 +262,31 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
     // REST: Configure seedbox credentials
     ctx.registerRoute("POST", "/config", async (event, routeCtx) => {
       if (!routeCtx.userId) {
-        return { error: "Authentication required to configure seedbox" };
+        return {
+          error: "Authentication required to configure seedbox",
+          code: "unauthorized" as const,
+        };
       }
       const config = ((await getRequestBody<QbitConfig>(event)) ||
         {}) as QbitConfig;
-      if (!config.baseUrl) {
-        return { error: "baseUrl is required" };
+      const parsed = parseQbitBaseUrl(config.baseUrl);
+      if (!parsed.ok) {
+        return { error: parsed.error, code: "invalid_config" as const };
       }
-      await ctx.storage.set("qbit_config", config);
+      const stored: StoredQbitConfig = { ...config, baseUrl: parsed.url };
+      if (config.password) {
+        const keyResult = readConfigKey();
+        if (!keyResult.ok) return keyResult.error;
+        if (!keyResult.key) {
+          return {
+            error: `Refusing to persist the qBittorrent password in plaintext; set ${SEEDBOX_CONFIG_KEY_ENV} to store it encrypted`,
+            code: "invalid_config" as const,
+          };
+        }
+        stored.password = encryptSecret(config.password, keyResult.key);
+        stored.credentialsEncrypted = true;
+      }
+      await ctx.storage.set(CONFIG_KEY, stored);
       // Credentials changed: drop any cached session used by progress polling.
       this.resetProgressPolling();
       return { success: true };
@@ -158,10 +296,19 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
     ctx.registerRoute(
       "GET",
       "/torrents",
-      async (): Promise<QbitTorrentsResponse | QbitApiError> => {
-        const config = await ctx.storage.get<QbitConfig>("qbit_config");
-        if (!config) {
-          return { error: "Seedbox not configured", code: "not_configured" };
+      async (
+        _event,
+        routeCtx,
+      ): Promise<QbitTorrentsResponse | QbitApiError> => {
+        if (!routeCtx.userId) {
+          return {
+            error: "Authentication required to view torrents",
+            code: "unauthorized",
+          };
+        }
+        const config = await resolveQbitConfig(ctx);
+        if ("error" in config) {
+          return config;
         }
         try {
           const client = this.clientFactory(config);
@@ -223,11 +370,15 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
     });
 
     // REST: Pause/resume/delete a torrent by hash — admin only
-    ctx.registerRoute("POST", "/torrents/:hash/pause", async (_event, routeCtx) =>
-      this.mutateTorrent(ctx, routeCtx, "pause"),
+    ctx.registerRoute(
+      "POST",
+      "/torrents/:hash/pause",
+      async (_event, routeCtx) => this.mutateTorrent(ctx, routeCtx, "pause"),
     );
-    ctx.registerRoute("POST", "/torrents/:hash/resume", async (_event, routeCtx) =>
-      this.mutateTorrent(ctx, routeCtx, "resume"),
+    ctx.registerRoute(
+      "POST",
+      "/torrents/:hash/resume",
+      async (_event, routeCtx) => this.mutateTorrent(ctx, routeCtx, "resume"),
     );
     ctx.registerRoute("DELETE", "/torrents/:hash", async (event, routeCtx) => {
       if (!routeCtx.userId) {
@@ -248,47 +399,23 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
     });
 
     // REST: Global transfer statistics
-    ctx.registerRoute("GET", "/transfer", async () =>
-      this.runWithClient(ctx, "GET /transfer", async (client) => {
+    ctx.registerRoute("GET", "/transfer", async (_event, routeCtx) => {
+      if (!routeCtx.userId) {
+        return {
+          error: "Authentication required to view transfer stats",
+          code: "unauthorized" as const,
+        };
+      }
+      return this.runWithClient(ctx, "GET /transfer", async (client) => {
         if (!client.getTransferInfo) {
           return { error: "Client does not support transfer stats" };
         }
         return { transfer: await client.getTransferInfo() };
-      }),
-    );
+      });
+    });
 
     // REST: Connection health (never throws; reports reachability/auth)
-    ctx.registerRoute("GET", "/health", async () => {
-      const config = await ctx.storage.get<QbitConfig>("qbit_config");
-      if (!config) {
-        return { error: "Seedbox not configured", code: "not_configured" };
-      }
-      const client = this.clientFactory(config);
-      if (client.checkHealth) {
-        return { health: await client.checkHealth() };
-      }
-      try {
-        await client.login();
-        return {
-          health: {
-            reachable: true,
-            authenticated: true,
-            checkedAt: Date.now(),
-            latencyMs: 0,
-          },
-        };
-      } catch (error) {
-        return {
-          health: {
-            reachable: false,
-            authenticated: false,
-            checkedAt: Date.now(),
-            latencyMs: 0,
-            error: error instanceof Error ? error.message : "unknown error",
-          },
-        };
-      }
-    });
+    this.registerHealthRoute(ctx);
 
     // REST: registered remote/seedbox depot endpoints (admin, lowest priority first)
     ctx.registerRoute("GET", "/depots", async (_event, routeCtx) => {
@@ -304,7 +431,8 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
       if (!routeCtx.userId) {
         return { error: "Authentication required to configure depots" };
       }
-      const body = ((await getRequestBody(event)) || {}) as Partial<SeedboxDepot>;
+      const body = ((await getRequestBody(event)) ||
+        {}) as Partial<SeedboxDepot>;
       if (!body.id || !body.endpoint) {
         return { error: "id and endpoint are required" };
       }
@@ -321,7 +449,9 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
         priority,
         updatedAt: Date.now(),
       };
-      const depots = (await readDepots(ctx)).filter((entry) => entry.id !== depot.id);
+      const depots = (await readDepots(ctx)).filter(
+        (entry) => entry.id !== depot.id,
+      );
       depots.push(depot);
       await ctx.storage.set(SEEDBOX_DEPOTS_KEY, depots);
       return { success: true, depot };
@@ -344,7 +474,8 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
       if (!routeCtx.userId) {
         return { error: "Authentication required to configure mappings" };
       }
-      const body = ((await getRequestBody(event)) || {}) as Partial<SeedboxGameMapping>;
+      const body = ((await getRequestBody(event)) ||
+        {}) as Partial<SeedboxGameMapping>;
       if (!body.gameId) {
         return { error: "gameId is required" };
       }
@@ -374,7 +505,16 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
     ctx.registerRoute(
       "GET",
       "/mappings",
-      async (_event, routeCtx): Promise<{ mapping: SeedboxGameMapping | null }> => {
+      async (
+        _event,
+        routeCtx,
+      ): Promise<{ mapping: SeedboxGameMapping | null } | QbitApiError> => {
+        if (!routeCtx.userId) {
+          return {
+            error: "Authentication required to view mappings",
+            code: "unauthorized",
+          };
+        }
         const hash = routeCtx.query?.hash;
         if (!hash) return { mapping: null };
         const mapping =
@@ -389,7 +529,16 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
     ctx.registerRoute(
       "GET",
       "/mappings/:gameId",
-      async (_event, routeCtx): Promise<{ mapping: SeedboxGameMapping | null }> => {
+      async (
+        _event,
+        routeCtx,
+      ): Promise<{ mapping: SeedboxGameMapping | null } | QbitApiError> => {
+        if (!routeCtx.userId) {
+          return {
+            error: "Authentication required to view mappings",
+            code: "unauthorized",
+          };
+        }
         const mapping =
           (await ctx.storage.get<SeedboxGameMapping>(
             `${SEEDBOX_MAPPING_GAME_PREFIX}${routeCtx.params.gameId}`,
@@ -441,14 +590,54 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
   }
 
   /** Build a logged-in client or return a typed "not configured" error. */
+  private registerHealthRoute(ctx: PluginContext): void {
+    ctx.registerRoute("GET", "/health", async (_event, routeCtx) => {
+      if (!routeCtx.userId) {
+        return {
+          error: "Authentication required to view seedbox health",
+          code: "unauthorized" as const,
+        };
+      }
+      try {
+        const config = await resolveQbitConfig(ctx);
+        if ("error" in config) {
+          // A configured-but-invalid URL is reported in the health shape so
+          // this route never throws; not-configured/decrypt errors stay typed.
+          if (config.code !== "invalid_config") {
+            return config;
+          }
+          return this.healthUnreachable(config.error);
+        }
+        const client = this.clientFactory(config);
+        if (client.checkHealth) {
+          return { health: await client.checkHealth() };
+        }
+        await client.login();
+        return {
+          health: {
+            reachable: true,
+            authenticated: true,
+            checkedAt: Date.now(),
+            latencyMs: 0,
+          },
+        };
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "unknown error";
+        ctx.logger.warn(`GET /health failed: ${message}`);
+        return this.healthUnreachable(message);
+      }
+    });
+  }
+
   private async runWithClient<T>(
     ctx: PluginContext,
     context: string,
     operation: (client: SeedboxClient, config: QbitConfig) => Promise<T>,
   ): Promise<T | QbitApiError> {
-    const config = await ctx.storage.get<QbitConfig>("qbit_config");
-    if (!config) {
-      return { error: "Seedbox not configured", code: "not_configured" };
+    const config = await resolveQbitConfig(ctx);
+    if ("error" in config) {
+      return config;
     }
     try {
       const client = this.clientFactory(config);
@@ -469,23 +658,28 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
     }
     const hash = routeCtx.params.hash;
     if (!hash) return { error: "hash is required" };
-    return this.runWithClient(ctx, `POST /torrents/${action}`, async (client) => {
-      const method = action === "pause" ? client.pauseTorrents : client.resumeTorrents;
-      if (!method) {
-        return { error: `Client does not support ${action} torrents` };
-      }
-      await method.call(client, [hash]);
-      return { success: true as const };
-    });
+    return this.runWithClient(
+      ctx,
+      `POST /torrents/${action}`,
+      async (client) => {
+        const method =
+          action === "pause" ? client.pauseTorrents : client.resumeTorrents;
+        if (!method) {
+          return { error: `Client does not support ${action} torrents` };
+        }
+        await method.call(client, [hash]);
+        return { success: true as const };
+      },
+    );
   }
 
   private async sendProgressSnapshot(
     ctx: PluginContext,
     send: (data: unknown) => void,
   ): Promise<void> {
-    const config = await ctx.storage.get<QbitConfig>("qbit_config");
-    if (!config) {
-      send(this.errorEvent({ error: "Seedbox not configured", code: "not_configured" }));
+    const config = await resolveQbitConfig(ctx);
+    if ("error" in config) {
+      send(this.errorEvent(config));
       return;
     }
     try {
@@ -515,12 +709,9 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
       this.stopProgressPollingIfIdle();
       return;
     }
-    const config = await ctx.storage.get<QbitConfig>("qbit_config");
-    if (!config) {
-      ctx.broadcast(
-        SEEDBOX_PROGRESS_CHANNEL,
-        this.errorEvent({ error: "Seedbox not configured", code: "not_configured" }),
-      );
+    const config = await resolveQbitConfig(ctx);
+    if ("error" in config) {
+      ctx.broadcast(SEEDBOX_PROGRESS_CHANNEL, this.errorEvent(config));
       return;
     }
     try {
@@ -568,6 +759,18 @@ export default class SeedboxPlugin implements ServerPlugin {  metadata = {
 
   private errorEvent(error: QbitApiError): SeedboxErrorEvent {
     return { event: "error", ...error, time: Date.now() };
+  }
+
+  private healthUnreachable(error: string): { health: QbitConnectionHealth } {
+    return {
+      health: {
+        reachable: false,
+        authenticated: false,
+        checkedAt: Date.now(),
+        latencyMs: 0,
+        error,
+      },
+    };
   }
 
   private toApiError(

@@ -48,7 +48,207 @@ export type QbitErrorCode =
   | "http_error"
   | "network_error"
   | "timeout"
-  | "invalid_response";
+  | "invalid_response"
+  | "invalid_config";
+
+export interface ParsedQbitBaseUrl {
+  ok: true;
+  /** Normalized absolute URL without a trailing slash. */
+  url: string;
+  /** Origin used for the qBittorrent `Origin`/`Referer` CSRF headers. */
+  origin: string;
+}
+
+export interface InvalidQbitBaseUrl {
+  ok: false;
+  error: string;
+}
+
+/** Opt-in env var that permits loopback seedbox targets: `SEEDBOX_ALLOW_LOOPBACK=true`. */
+export const SEEDBOX_ALLOW_LOOPBACK_ENV = "SEEDBOX_ALLOW_LOOPBACK";
+
+export interface QbitHostPolicy {
+  /**
+   * Permit loopback targets (127.0.0.0/8, ::1, localhost). Defaults to the
+   * `SEEDBOX_ALLOW_LOOPBACK=true` environment opt-in. RFC1918 and IPv6 ULA
+   * addresses are always allowed so LAN seedboxes keep working.
+   */
+  allowLoopback?: boolean;
+}
+
+export interface ValidQbitHost {
+  ok: true;
+}
+
+export interface InvalidQbitHost {
+  ok: false;
+  error: string;
+}
+
+function normalizeQbitHostname(hostname: string): string {
+  const host = hostname.trim().toLowerCase();
+  return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+}
+
+function ipv4Octets(host: string): number[] | null {
+  const parts = host.split(".");
+  if (parts.length !== 4) return null;
+  const octets = parts.map((part) =>
+    /^\d{1,3}$/.test(part) ? Number(part) : Number.NaN,
+  );
+  if (octets.some((octet) => !Number.isInteger(octet) || octet > 255)) {
+    return null;
+  }
+  return octets;
+}
+
+/** Expand an IPv6 literal into eight 16-bit groups (IPv4-embedded supported). */
+function ipv6Groups(host: string): number[] | null {
+  if (!host.includes(":")) return null;
+  let address = host;
+  const lastColon = host.lastIndexOf(":");
+  const lastGroup = lastColon === -1 ? host : host.slice(lastColon + 1);
+  if (lastGroup.includes(".")) {
+    const octets = ipv4Octets(lastGroup);
+    if (!octets) return null;
+    const hi = ((octets[0] << 8) | octets[1]).toString(16);
+    const lo = ((octets[2] << 8) | octets[3]).toString(16);
+    address = `${host.slice(0, lastColon + 1)}${hi}:${lo}`;
+  }
+  const [headPart, tailPart, ...extra] = address.split("::");
+  if (extra.length > 0) return null;
+  const parseGroups = (part: string): number[] | null => {
+    if (!part) return [];
+    const groups = part
+      .split(":")
+      .map((group) =>
+        /^[0-9a-f]{1,4}$/i.test(group)
+          ? Number.parseInt(group, 16)
+          : Number.NaN,
+      );
+    return groups.some((group) => Number.isNaN(group)) ? null : groups;
+  };
+  const head = parseGroups(headPart ?? "");
+  if (!head) return null;
+  if (tailPart === undefined) return head.length === 8 ? head : null;
+  const tail = parseGroups(tailPart);
+  if (!tail) return null;
+  const fill = 8 - head.length - tail.length;
+  if (fill < 1) return null;
+  return [...head, ...new Array<number>(fill).fill(0), ...tail];
+}
+
+function ipv4MappedOctets(groups: number[]): number[] | null {
+  const isMapped =
+    groups.length === 8 &&
+    groups.slice(0, 5).every((group) => group === 0) &&
+    groups[5] === 0xffff;
+  if (!isMapped) return null;
+  return [groups[6] >> 8, groups[6] & 0xff, groups[7] >> 8, groups[7] & 0xff];
+}
+
+function isLoopbackHostname(host: string): boolean {
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  const octets = ipv4Octets(host);
+  if (octets) return octets[0] === 127;
+  const groups = ipv6Groups(host);
+  if (!groups) return false;
+  const mapped = ipv4MappedOctets(groups);
+  if (mapped) return mapped[0] === 127;
+  return groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1;
+}
+
+function isLinkLocalHostname(host: string): boolean {
+  const octets = ipv4Octets(host);
+  if (octets) return octets[0] === 169 && octets[1] === 254;
+  const groups = ipv6Groups(host);
+  if (!groups) return false;
+  const mapped = ipv4MappedOctets(groups);
+  if (mapped) return mapped[0] === 169 && mapped[1] === 254;
+  return (groups[0] & 0xffc0) === 0xfe80;
+}
+
+function isUnspecifiedHostname(host: string): boolean {
+  const octets = ipv4Octets(host);
+  if (octets) return octets.every((octet) => octet === 0);
+  const groups = ipv6Groups(host);
+  return groups ? groups.every((group) => group === 0) : false;
+}
+
+/**
+ * Apply the seedbox SSRF host policy. Link-local (cloud metadata) and
+ * unspecified targets are always rejected; loopback is rejected unless
+ * `policy.allowLoopback` or the `SEEDBOX_ALLOW_LOOPBACK=true` opt-in is set.
+ * RFC1918 and IPv6 ULA (fc00::/7) ranges remain allowed: LAN seedboxes are the
+ * primary use case.
+ */
+export function validateQbitHost(
+  hostname: string,
+  policy: QbitHostPolicy = {},
+): ValidQbitHost | InvalidQbitHost {
+  const host = normalizeQbitHostname(hostname);
+  if (!host) {
+    return { ok: false, error: "baseUrl must include a host" };
+  }
+  if (isLinkLocalHostname(host)) {
+    return {
+      ok: false,
+      error: `baseUrl host "${host}" is a link-local address; metadata endpoints are not allowed`,
+    };
+  }
+  if (isUnspecifiedHostname(host)) {
+    return {
+      ok: false,
+      error: `baseUrl host "${host}" is the unspecified address and is not a valid seedbox target`,
+    };
+  }
+  const allowLoopback =
+    policy.allowLoopback ??
+    process.env[SEEDBOX_ALLOW_LOOPBACK_ENV]?.trim().toLowerCase() === "true";
+  if (!allowLoopback && isLoopbackHostname(host)) {
+    return {
+      ok: false,
+      error: `baseUrl host "${host}" is a loopback address; set ${SEEDBOX_ALLOW_LOOPBACK_ENV}=true to allow loopback seedbox targets`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Validate and normalize a qBittorrent base URL. Only absolute `http(s)` URLs
+ * are accepted; URLs carrying embedded credentials are rejected so they cannot
+ * be silently persisted or leaked via logs. Hosts are checked against the
+ * seedbox SSRF policy (loopback, link-local, unspecified).
+ */
+export function parseQbitBaseUrl(
+  raw: unknown,
+  policy: QbitHostPolicy = {},
+): ParsedQbitBaseUrl | InvalidQbitBaseUrl {
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return { ok: false, error: "baseUrl is required" };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw.trim());
+  } catch {
+    return { ok: false, error: "baseUrl must be an absolute http(s) URL" };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, error: "baseUrl must use the http or https scheme" };
+  }
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      error:
+        "baseUrl must not contain embedded credentials; use the username/password fields",
+    };
+  }
+  const hostCheck = validateQbitHost(parsed.hostname, policy);
+  if (!hostCheck.ok) return hostCheck;
+  let url = parsed.toString();
+  while (url.endsWith("/")) url = url.slice(0, -1);
+  return { ok: true, url, origin: parsed.origin };
+}
 
 export class QBittorrentError extends Error {
   readonly code: QbitErrorCode;
@@ -122,7 +322,8 @@ export async function withBackoff<T>(
   const maxDelayMs = options.maxDelayMs ?? DEFAULT_BACKOFF_MAX_MS;
   const retryable = options.isRetryable ?? isRetryableQbitError;
   const sleep =
-    options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    options.sleep ??
+    ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -158,15 +359,19 @@ function extractSessionCookie(res: Response): string | null {
 export class QBittorrentClient {
   private cookie: string | null = null;
   private readonly baseUrl: string;
+  private readonly origin: string;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly backoffBaseMs: number;
   private readonly fetchFn: typeof fetch;
 
   constructor(private readonly config: QbitConfig) {
-    let baseUrl = config.baseUrl;
-    while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
-    this.baseUrl = baseUrl;
+    const parsed = parseQbitBaseUrl(config.baseUrl);
+    if (!parsed.ok) {
+      throw new QBittorrentError(parsed.error, { code: "invalid_config" });
+    }
+    this.baseUrl = parsed.url;
+    this.origin = parsed.origin;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.backoffBaseMs = config.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS;
@@ -240,15 +445,14 @@ export class QBittorrentClient {
   /** Add a torrent from a magnet/URL or raw `.torrent` file. */
   async addTorrent(options: QbitAddTorrentOptions): Promise<void> {
     if (!options.url && !options.torrentFile) {
-      throw new QBittorrentError(
-        "addTorrent requires a url or torrentFile",
-        { code: "invalid_response" },
-      );
+      throw new QBittorrentError("addTorrent requires a url or torrentFile", {
+        code: "invalid_response",
+      });
     }
-    await withBackoff(
-      () => this.sendTorrentAdd(options),
-      { maxRetries: this.maxRetries, baseDelayMs: this.backoffBaseMs },
-    );
+    await withBackoff(() => this.sendTorrentAdd(options), {
+      maxRetries: this.maxRetries,
+      baseDelayMs: this.backoffBaseMs,
+    });
   }
 
   /** Pause one or more torrents by hash. */
@@ -281,11 +485,7 @@ export class QBittorrentClient {
     return withBackoff(
       async () => {
         const payload = await this.getJson<unknown>("/api/v2/transfer/info");
-        if (
-          !payload ||
-          typeof payload !== "object" ||
-          Array.isArray(payload)
-        ) {
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
           throw new QBittorrentError(
             "qBittorrent returned an unexpected transfer payload",
             { code: "invalid_response" },
@@ -344,7 +544,10 @@ export class QBittorrentClient {
   }
 
   private async fetchTorrents(allowRelogin = true): Promise<QbitTorrent[]> {
-    const payload = await this.getJson<unknown>("/api/v2/torrents/info", allowRelogin);
+    const payload = await this.getJson<unknown>(
+      "/api/v2/torrents/info",
+      allowRelogin,
+    );
     if (!Array.isArray(payload)) {
       throw new QBittorrentError(
         "qBittorrent returned an unexpected torrents payload",
@@ -453,6 +656,10 @@ export class QBittorrentClient {
     if (withSession && this.cookie) {
       headers.set("cookie", this.cookie);
     }
+    // qBittorrent's WebUI CSRF protection expects Referer/Origin matching the
+    // request Host; set them unless the caller overrides them.
+    if (!headers.has("origin")) headers.set("origin", this.origin);
+    if (!headers.has("referer")) headers.set("referer", `${this.baseUrl}/`);
     try {
       return await this.fetchFn(`${this.baseUrl}${path}`, {
         ...init,
