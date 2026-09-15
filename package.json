@@ -12,10 +12,10 @@
     "lint": "eslint ."
   },
   "dependencies": {
-    "@droposs/plugin-sdk": "^0.4.0"
+    "@droposs/plugin-sdk": "file:../drop-plugin-sdk/packages/plugin-sdk"
   },
   "devDependencies": {
-    "@droposs/plugin-cli": "^0.4.0",
+    "@droposs/plugin-cli": "file:../drop-plugin-sdk/packages/plugin-cli",
     "typescript": "^5.7.0",
     "@types/node": "^22.0.0",
     "@eslint/js": "^10.0.1",
