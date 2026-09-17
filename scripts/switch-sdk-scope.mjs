@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* global process, console */
 
 import { readdirSync, readFileSync, statSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
@@ -69,11 +70,7 @@ function rewritePackageJson(file, text) {
         continue;
       }
       const target = `${scope}/${kind}`;
-      if (section[dep].startsWith("file:") || section[dep].startsWith("workspace:") || section[dep].startsWith("npm:")) {
-        rebuilt[target] = kind === "plugin-sdk" ? sdkVersion : cliVersion;
-      } else {
-        rebuilt[target] = section[dep];
-      }
+      rebuilt[target] = kind === "plugin-sdk" ? sdkVersion : cliVersion;
     }
     pkg[sectionName] = rebuilt;
   }
@@ -120,7 +117,11 @@ if (edited.length) {
 const installDir = process.cwd();
 
 if (existsSync(path.join(installDir, "package-lock.json"))) {
-  execSync("npm install --no-audit --no-fund", { cwd: installDir, stdio: "inherit" });
+  try {
+    execSync("npm install --no-audit --no-fund", { cwd: installDir, stdio: "inherit" });
+  } catch {
+    execSync("npm install --no-audit --no-fund --legacy-peer-deps", { cwd: installDir, stdio: "inherit" });
+  }
 } else if (existsSync(path.join(installDir, "pnpm-lock.yaml"))) {
   execSync("pnpm install", { cwd: installDir, stdio: "inherit" });
 } else {

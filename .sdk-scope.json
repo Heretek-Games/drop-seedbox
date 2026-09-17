@@ -1,5 +1,5 @@
 {
   "sdk": "@droposs",
-  "sdkVersion": "^0.5.9",
-  "cliVersion": "^0.5.9"
+  "sdkVersion": "^0.6.0",
+  "cliVersion": "^0.6.0"
 }
