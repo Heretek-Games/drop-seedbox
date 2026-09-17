@@ -1,0 +1,60 @@
+name: Release Drop Plugin
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build, validate, and publish .dropplugin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout@v7.0.1
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # actions/setup-node@v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Validate manifest
+        run: npx --no-install drop-plugin validate .
+
+      - name: Pack plugin archive
+        run: npx --no-install drop-plugin pack . ./dist-package
+
+      - name: Generate checksums
+        id: pkg
+        run: |
+          FILE=$(find dist-package -name "*.dropplugin" -print -quit)
+          echo "path=$FILE" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$FILE")" >> "$GITHUB_OUTPUT"
+          sha256sum "$FILE" > "$FILE.sha256"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pkg.outputs.path }}
+            ${{ steps.pkg.outputs.path }}.sha256
+          name: ${{ steps.pkg.outputs.name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
