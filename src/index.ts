@@ -327,7 +327,10 @@ export default class SeedboxPlugin implements ServerPlugin {
     // REST: Add a torrent (magnet/URL or base64 .torrent) — admin only
     ctx.registerRoute("POST", "/torrents", async (event, routeCtx) => {
       if (!routeCtx.userId) {
-        return { error: "Authentication required to add torrents" };
+        return {
+          error: "Authentication required to add torrents",
+          code: "unauthorized" as const,
+        };
       }
       const body = ((await getRequestBody(event)) || {}) as {
         url?: string;
@@ -382,7 +385,10 @@ export default class SeedboxPlugin implements ServerPlugin {
     );
     ctx.registerRoute("DELETE", "/torrents/:hash", async (event, routeCtx) => {
       if (!routeCtx.userId) {
-        return { error: "Authentication required to delete torrents" };
+        return {
+          error: "Authentication required to delete torrents",
+          code: "unauthorized" as const,
+        };
       }
       const hash = routeCtx.params.hash;
       if (!hash) return { error: "hash is required" };
@@ -420,7 +426,10 @@ export default class SeedboxPlugin implements ServerPlugin {
     // REST: registered remote/seedbox depot endpoints (admin, lowest priority first)
     ctx.registerRoute("GET", "/depots", async (_event, routeCtx) => {
       if (!routeCtx.userId) {
-        return { error: "Authentication required to view depots" };
+        return {
+          error: "Authentication required to view depots",
+          code: "unauthorized" as const,
+        };
       }
       const depots = await readDepots(ctx);
       depots.sort((a, b) => a.priority - b.priority);
@@ -429,7 +438,10 @@ export default class SeedboxPlugin implements ServerPlugin {
 
     ctx.registerRoute("POST", "/depots", async (event, routeCtx) => {
       if (!routeCtx.userId) {
-        return { error: "Authentication required to configure depots" };
+        return {
+          error: "Authentication required to configure depots",
+          code: "unauthorized" as const,
+        };
       }
       const body = ((await getRequestBody(event)) ||
         {}) as Partial<SeedboxDepot>;
@@ -459,7 +471,10 @@ export default class SeedboxPlugin implements ServerPlugin {
 
     ctx.registerRoute("DELETE", "/depots/:id", async (_event, routeCtx) => {
       if (!routeCtx.userId) {
-        return { error: "Authentication required to configure depots" };
+        return {
+          error: "Authentication required to configure depots",
+          code: "unauthorized" as const,
+        };
       }
       const id = routeCtx.params.id;
       if (!id) return { error: "id is required" };
@@ -472,7 +487,10 @@ export default class SeedboxPlugin implements ServerPlugin {
     // REST: Associate a torrent/hash or content path with a Drop game
     ctx.registerRoute("POST", "/mappings", async (event, routeCtx) => {
       if (!routeCtx.userId) {
-        return { error: "Authentication required to configure mappings" };
+        return {
+          error: "Authentication required to configure mappings",
+          code: "unauthorized" as const,
+        };
       }
       const body = ((await getRequestBody(event)) ||
         {}) as Partial<SeedboxGameMapping>;
@@ -654,7 +672,10 @@ export default class SeedboxPlugin implements ServerPlugin {
     action: "pause" | "resume",
   ): Promise<unknown> {
     if (!routeCtx.userId) {
-      return { error: `Authentication required to ${action} torrents` };
+      return {
+        error: `Authentication required to ${action} torrents`,
+        code: "unauthorized" as const,
+      };
     }
     const hash = routeCtx.params.hash;
     if (!hash) return { error: "hash is required" };

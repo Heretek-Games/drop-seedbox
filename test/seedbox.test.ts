@@ -7,7 +7,7 @@ import SeedboxPlugin, {
   type SeedboxClient,
 } from "../src/index.js";
 import { QBittorrentError, type QbitTorrent } from "../src/qbittorrent.js";
-import { decryptSecret, loadConfigKey } from "../src/secrets.js";
+import { decryptSecret, encryptSecret, loadConfigKey } from "../src/secrets.js";
 
 process.env.DROP_SEEDBOX_CONFIG_KEY =
   "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -231,16 +231,25 @@ test("POST /config refuses to persist a plaintext password without a key", async
   }
 });
 
-test("GET read routes reject unauthenticated callers", async () => {
+test("REST routes reject unauthenticated callers", async () => {
   const plugin = makePlugin({ client: fakeClient() });
   const ctx = makeCtx();
   await plugin.init(ctx);
   await ctx.storage.set("qbit_config", { ...CONFIG });
 
   const checks: Array<[string, Record<string, string>]> = [
+    ["POST /config", {}],
     ["GET /torrents", {}],
+    ["POST /torrents", {}],
+    ["POST /torrents/:hash/pause", { hash: "h1" }],
+    ["POST /torrents/:hash/resume", { hash: "h1" }],
+    ["DELETE /torrents/:hash", { hash: "h1" }],
     ["GET /transfer", {}],
     ["GET /health", {}],
+    ["GET /depots", {}],
+    ["POST /depots", {}],
+    ["DELETE /depots/:id", { id: "d1" }],
+    ["POST /mappings", {}],
     ["GET /mappings", { hash: "h1" }],
     ["GET /mappings/:gameId", { gameId: "g1" }],
   ];
@@ -703,6 +712,52 @@ test("legacy plaintext credentials are re-sealed in storage on read", async () =
   assert.equal(decryptSecret(stored.password, key), "legacy-password");
 
   await plugin.teardown();
+});
+
+test("decryptSecret rejects tampered ciphertext, auth tag, or malformed payloads", () => {
+  const key = loadConfigKey();
+  assert.ok(key, "the test encryption key must be configured");
+  const secret = "super-secret-password";
+  const encrypted = encryptSecret(secret, key);
+
+  // Success baseline
+  assert.equal(decryptSecret(encrypted, key), secret);
+
+  const parts = encrypted.split(":");
+  assert.equal(parts.length, 4);
+  const [version, ivB64, tagB64, ciphertextB64] = parts;
+
+  // Tamper ciphertext
+  const rawCiphertext = Buffer.from(ciphertextB64, "base64");
+  rawCiphertext[0] ^= 0x01;
+  const tamperedCiphertext = [
+    version,
+    ivB64,
+    tagB64,
+    rawCiphertext.toString("base64"),
+  ].join(":");
+  assert.throws(() => decryptSecret(tamperedCiphertext, key));
+
+  // Tamper auth tag
+  const rawTag = Buffer.from(tagB64, "base64");
+  rawTag[0] ^= 0x01;
+  const tamperedTag = [
+    version,
+    ivB64,
+    rawTag.toString("base64"),
+    ciphertextB64,
+  ].join(":");
+  assert.throws(() => decryptSecret(tamperedTag, key));
+
+  // Malformed payloads
+  assert.throws(
+    () => decryptSecret("invalid-payload", key),
+    /Malformed encrypted seedbox secret/,
+  );
+  assert.throws(
+    () => decryptSecret(`v2:${ivB64}:${tagB64}:${ciphertextB64}`, key),
+    /Malformed encrypted seedbox secret/,
+  );
 });
 
 test("legacy plaintext credentials still resolve when no key is configured", async () => {
