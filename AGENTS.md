@@ -1,6 +1,6 @@
 # AGENTS.md — Drop Seedbox contributor & AI agent guide
 
-**Drop Seedbox** (`drop-seedbox`) manages qBittorrent WebUI integration for the Drop platform. Remote streaming depots are roadmap work, not shipped.
+**Drop Seedbox** (`drop-seedbox`) manages qBittorrent WebUI integration for the Drop platform. It registers a `storage:depot` `DepotStorageProvider` that exposes mapped seedbox content as an HTTP range stream (a range-capable file server behind each depot `endpoint`); consumption of that stream by the core depot/chunk pipeline is in progress.
 
 ---
 

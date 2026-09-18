@@ -63,6 +63,9 @@ export interface SeedboxGameMapping {
 export const SEEDBOX_MAPPING_GAME_PREFIX = "mapping:game:";
 export const SEEDBOX_MAPPING_HASH_PREFIX = "mapping:hash:";
 
+/** Optional static Authorization header used when reading remote depot streams. */
+export const SEEDBOX_STREAM_AUTH_KEY = "seedbox:stream-auth";
+
 export type QbitApiErrorCode =
   QbitErrorCode | "not_configured" | "unauthorized" | "unknown";
 
@@ -241,6 +244,7 @@ export default class SeedboxPlugin implements ServerPlugin {
       "network" as const,
       "websocket" as const,
       "events" as const,
+      "storage:depot" as const,
     ],
   };
 
@@ -256,8 +260,53 @@ export default class SeedboxPlugin implements ServerPlugin {
       options.clientFactory ?? ((config) => new QBittorrentClient(config));
   }
 
+  /**
+   * Resolve a remote depot read stream for a game via the `storage:depot` SPI.
+   *
+   * The seedbox does not serve torrent bytes itself; this returns an HTTP `url`
+   * pointing at the configured depot endpoint (a range-capable file server)
+   * using the game's mapped content path or torrent hash. Returning `null`
+   * means no usable remote depot is configured, so the host falls back to a
+   * local backend.
+   */
+  async resolveDepotStream(
+    ctx: PluginContext,
+    depotId: string,
+    gameId: string,
+  ): Promise<{ url: string; headers?: Record<string, string> } | null> {
+    const depots = (await readDepots(ctx)).filter((depot) => depot.enabled);
+    const depot = depotId
+      ? depots.find((entry) => entry.id === depotId)
+      : [...depots].sort((a, b) => a.priority - b.priority)[0];
+    if (!depot) return null;
+
+    const mapping = await ctx.storage.get<SeedboxGameMapping>(
+      `${SEEDBOX_MAPPING_GAME_PREFIX}${gameId}`,
+    );
+    const resource = mapping?.contentPath ?? mapping?.hash;
+    if (!mapping || !resource) return null;
+
+    const base = depot.endpoint.replace(/\/+$/, "");
+    const stream: { url: string; headers?: Record<string, string> } = {
+      url: `${base}/${encodeURIComponent(resource)}`,
+    };
+    const authorization = await ctx.storage.get<string>(
+      SEEDBOX_STREAM_AUTH_KEY,
+    );
+    if (authorization) stream.headers = { Authorization: authorization };
+    return stream;
+  }
+
   async init(ctx: PluginContext): Promise<void> {
     ctx.logger.info("Initializing Seedbox & qBittorrent plugin...");
+
+    // Remote depot SPI: expose mapped seedbox content as a remote stream.
+    ctx.registerDepotProvider?.({
+      id: "drop-seedbox",
+      name: this.metadata.name,
+      resolveDepotStream: (depotId, gameId) =>
+        this.resolveDepotStream(ctx, depotId, gameId),
+    });
 
     // REST: Configure seedbox credentials
     ctx.registerRoute("POST", "/config", async (event, routeCtx) => {

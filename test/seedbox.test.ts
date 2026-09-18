@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { MockPluginContext } from "@droposs/plugin-sdk";
 import SeedboxPlugin, {
   SEEDBOX_ALLOW_LOOPBACK_ENV,
+  SEEDBOX_DEPOTS_KEY,
+  SEEDBOX_MAPPING_GAME_PREFIX,
   SEEDBOX_PROGRESS_CHANNEL,
+  SEEDBOX_STREAM_AUTH_KEY,
   type SeedboxClient,
 } from "../src/index.js";
 import { QBittorrentError, type QbitTorrent } from "../src/qbittorrent.js";
@@ -41,6 +44,7 @@ function makeCtx(): MockPluginContext {
     "network",
     "websocket",
     "events",
+    "storage:depot",
   ]);
 }
 
@@ -892,3 +896,90 @@ test("depot registry requires auth and orders by priority", async () => {
 
   await plugin.teardown();
 });
+
+test("DepotStorageProvider resolves mapped seedbox content as an HTTP stream", async () => {
+  const plugin = makePlugin();
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+
+  const provider = ctx.depotProviders.get("drop-seedbox");
+  assert.ok(provider, "drop-seedbox must register a depot provider");
+
+  // No depot configured yet.
+  assert.equal(await provider.resolveDepotStream("", "game-1"), null);
+
+  await ctx.storage.set(SEEDBOX_DEPOTS_KEY, [
+    {
+      id: "primary",
+      endpoint: "https://seed.example/depot/",
+      enabled: true,
+      priority: 10,
+      updatedAt: 0,
+    },
+  ]);
+
+  // Depot registered but the game has no mapping.
+  assert.equal(await provider.resolveDepotStream("", "game-1"), null);
+
+  await ctx.storage.set(`${SEEDBOX_MAPPING_GAME_PREFIX}game-1`, {
+    gameId: "game-1",
+    contentPath: "My Game/Game.exe",
+    updatedAt: 0,
+  });
+  const stream = await provider.resolveDepotStream("", "game-1");
+  assert.equal(
+    stream?.url,
+    "https://seed.example/depot/My%20Game%2FGame.exe",
+  );
+
+  await ctx.storage.set(SEEDBOX_STREAM_AUTH_KEY, "Bearer t");
+  const authed = await provider.resolveDepotStream("primary", "game-1");
+  assert.deepEqual(authed?.headers, { Authorization: "Bearer t" });
+});
+
+test("DepotStorageProvider selects the lowest-priority enabled depot", async () => {
+  const plugin = makePlugin();
+  const ctx = makeCtx();
+  await plugin.init(ctx);
+  const provider = ctx.depotProviders.get("drop-seedbox");
+  assert.ok(provider);
+
+  await ctx.storage.set(SEEDBOX_DEPOTS_KEY, [
+    {
+      id: "slow",
+      endpoint: "https://slow.example",
+      enabled: true,
+      priority: 100,
+      updatedAt: 0,
+    },
+    {
+      id: "fast",
+      endpoint: "https://fast.example",
+      enabled: true,
+      priority: 1,
+      updatedAt: 0,
+    },
+    {
+      id: "off",
+      endpoint: "https://off.example",
+      enabled: false,
+      priority: 0,
+      updatedAt: 0,
+    },
+  ]);
+  await ctx.storage.set(`${SEEDBOX_MAPPING_GAME_PREFIX}game-1`, {
+    gameId: "game-1",
+    hash: "abc123",
+    updatedAt: 0,
+  });
+
+  const stream = await provider.resolveDepotStream("", "game-1");
+  assert.equal(stream?.url, "https://fast.example/abc123");
+
+  const explicit = await provider.resolveDepotStream("slow", "game-1");
+  assert.equal(explicit?.url, "https://slow.example/abc123");
+
+  const disabled = await provider.resolveDepotStream("off", "game-1");
+  assert.equal(disabled, null);
+});
+
