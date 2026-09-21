@@ -50,7 +50,7 @@ jobs:
           sha256sum "$FILE" > "$FILE.sha256"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ steps.pkg.outputs.path }}
